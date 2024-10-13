@@ -12,7 +12,7 @@ import copy
 
 # Debugging flag
 debugme = 1  # Set to 0 to disable debugging window
-moderatorPromptEnd = " Please instruct the best next agent to speak by providing a JSON response with 'next_agent' which names the next agent and 'agent_instruction' which addressed the agent by name and guides the conversation. ONLY respond with JSON"
+moderatorPromptEnd = " Please instruct the best next agent to speak by providing a JSON response with 'next_agent' which names the next agent,'agent_instruction' which addresses the agent by name and guides the conversation, and if the conversation goals are met 'final_thoughts' which sums up the conversation.  ONLY respond with JSON"
 
 def clean_response(content: str) -> str:
     """
@@ -91,9 +91,11 @@ class FeedbackAgent:
        
         response = self.llm.invoke(messages)
         response_text = response.content.strip()
-        
+        newMessage = AIMessage(content=self.name+":"+ response_text)
+
+
         # Add response to conversation
-        state['conversation_messages'].append(response)
+        state['conversation_messages'].append(newMessage)
         
         # Collect debugging info
         if 'debugging_info' not in state:
@@ -234,11 +236,14 @@ class ModeratorAgent:
         # Clean response content by removing code fences
         cleaned_content = clean_response(response.content)
         response_content = json.loads(cleaned_content)
-        
-        # Add agent_instruction to conversation_messages as AIMessage
-        agent_instruction = response_content.get('agent_instruction', '')
-        state['conversation_messages'].append(HumanMessage(agent_instruction))
-        state['nextAgent'] = response_content.get('next_agent', 'END')
+        if 'final_thoughts' in response_content and response_content['final_thoughts']!="" and response_content['final_thoughts'] is not None:
+            state['conversation_messages'].append(AIMessage(state['moderatorName']+":"+response_content['final_thoughts']))
+            state['nextAgent']='END'
+        else:
+            # Add agent_instruction to conversation_messages as AIMessage
+            agent_instruction = response_content.get('agent_instruction', '')
+            state['conversation_messages'].append(HumanMessage(state['moderatorName']+":"+agent_instruction))
+            state['nextAgent'] = response_content.get('next_agent', 'END')
         
         # Collect debugging info
         if 'debugging_info' not in state:
@@ -256,10 +261,13 @@ setup_agent = SetupAgent(openai_llm)
 # Moderator agent will be initialized after setup
 
 def should_continue(state: AgentState) -> str:
-    return state.get('nextAgent', 'END')
+    nextState = state.get('nextAgent', 'END')
+    if nextState.upper() =='END':
+        nextState = END
+    return nextState
 
 def format_messages(messages: List[Union[SystemMessage, HumanMessage, AIMessage]]) -> str:
-    return "\n\n".join([f"{m.__class__.__name__}: {m.content}" for m in messages])
+    return "\n\n".join([f"{m.content}" for m in messages])
 
 def setup_conversation(setup_info: str):
     # Generate setup using SetupAgent
