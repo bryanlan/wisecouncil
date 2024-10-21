@@ -12,7 +12,7 @@ import copy
 
 # Debugging flag
 debugme = 1  # Set to 0 to disable debugging window
-moderatorPromptEnd = " Please instruct the best next agent to speak by providing a JSON response with 'next_agent' which names the next agent,'agent_instruction' which addresses the agent by name and guides the conversation, and if the conversation goals are met 'final_thoughts' which sums up the conversation.  ONLY respond with JSON"
+moderatorPromptEnd = " Please instruct the best next agent to speak by providing a JSON response with 'next_agent' which names the next agent, using END if the conversation goals are met,'agent_instruction' which addresses the agent by name and guides the conversation, and 'final_thoughts' which sums up the conversation.  ONLY respond with JSON"
 
 def clean_response(content: str) -> str:
     """
@@ -169,7 +169,7 @@ class SetupAgent:
         # Prepare the prompt
         prompt = (
             f"You are a setup agent. Based on the following setup information: '{setup_info}', and the available agents:\n{llm_descriptions}\n\n"
-            f"Determine how many agents are needed, what specific and complimentary roles they should play, and assign LLMs accordingly. "
+            f"Determine how many agents are needed, what specific and complimentary roles they should play, and assign LLMs accordingly. Do not use a moderator unless one is specifically requested."
             f"Pick a topology type from the following options:\n"
             f"a) round_robin - no moderator\n"
             f"b) last_decides_next - no moderator\n"
@@ -236,7 +236,7 @@ class ModeratorAgent:
         # Clean response content by removing code fences
         cleaned_content = clean_response(response.content)
         response_content = json.loads(cleaned_content)
-        if 'final_thoughts' in response_content and response_content['final_thoughts']!="" and response_content['final_thoughts'] is not None:
+        if state['nextAgent'].upper()== 'END' and response_content['final_thoughts'] is not None:
             state['conversation_messages'].append(AIMessage(state['moderatorName']+":"+response_content['final_thoughts']))
             state['nextAgent']='END'
         else:
@@ -376,6 +376,7 @@ def run_conversation(
 
     elif topology_type == 'last_decides_next':
         # Add FeedbackAgent nodes and conditional edges
+        first_agent_name = agent_objects.keys()[0]
         for agent_name, feedback_agent in agent_objects.items():
             workflow.add_node(agent_name, feedback_agent.generate_response)
             workflow.add_conditional_edges(agent_name, should_continue)
@@ -398,11 +399,13 @@ def run_conversation(
     # Set the entry point
     if topology_type in ['moderator_discretionary', 'moderated_round_robin']:
         workflow.set_entry_point(moderatorName)
-    elif topology_type in ['round_robin', 'last_decides_next']:
+    elif topology_type in ['round_robin']:
         # Start with the first agent in agent_order for round robin or last_decides_next
         if agents_list:
             first_agent_name = agents_list[0]['name']
             workflow.set_entry_point(first_agent_name)
+            #remove the first agent so that the appropriate next agent will be used
+            agent_order.pop(0)
         else:
             return "Error: No agents defined.", ""
 
