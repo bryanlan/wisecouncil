@@ -91,7 +91,10 @@ class FeedbackAgent:
        
         response = self.llm.invoke(messages)
         response_text = response.content.strip()
-        newMessage = AIMessage(content=self.name+":"+ response_text)
+        if not response_text.startswith(self.name + ":"):
+            response_text = self.name + ":" + response_text
+
+        newMessage = AIMessage(content=response_text)
 
 
         # Add response to conversation
