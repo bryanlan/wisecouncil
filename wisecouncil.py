@@ -8,9 +8,11 @@ import trafilatura
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import time
+import base64
 import random
 import gradio as gr
 import os
+import io
 import keys
 import json
 import re
@@ -20,6 +22,7 @@ from readability import Document
 import requests
 import justext
 import html2text
+from PIL import Image
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -113,7 +116,7 @@ class Tool:
         return self.func(input_data)
     
 class ResearchTool(Tool):
-    def __init__(self):
+    def __init__(self,max_total_image_interpretations: int = 10, max_interpretations_per_page: int = 4, dismissPopups=True):
         super().__init__(
             name="do_research",
             description="Perform internet research on a given query",
@@ -123,11 +126,136 @@ class ResearchTool(Tool):
         self.search_engine_id = keys.GOOGLE_SEARCH_ENGINE_ID
         self.setup_driver()
         self.service = build("customsearch", "v1", developerKey=self.api_key)
+        self.dismissPopups = dismissPopups
         
         # Common problematic domains that might block scraping
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
+        # Inside the __init__ method of ResearchTool
+        # Inside the __init__ method of ResearchTool
+        self.popup_selectors = [
+        "button.accept-cookies",
+        "button.cookie-consent-accept",
+        "button#accept",
+        "button#cookieAccept",
+        "button[class*='accept']",
+        "button[class*='agree']",
+        "button[class*='consent']",
+        "button[class*='close']",
+        ".cookie-consent button",
+        ".cookie-banner button",
+        ".modal-footer button.btn-primary",
+        ".popup-close",
+        ".overlay-close",
+        # Add more selectors as needed
+    ]
+
+        self.alert_texts = [
+            "Allow",
+            "Deny",
+            "Block",
+            "No Thanks",
+            "Not Now",
+            "Cancel",
+            "Close",
+            "Reject",
+            "Decline",
+            "Got it",
+            "OK",
+            # Add more texts as needed
+        ]
+
+        # Initialize interpretation limits and counters
+        self.max_total_image_interpretations = max_total_image_interpretations
+        self.max_interpretations_per_page = max_interpretations_per_page
+        self.total_image_interpretations = 0
+        # Initialize extracted texts accumulator
+        self.accumulated_extracted_texts = []  # Accumulates all extracted texts per search
+
+
+    
+
+    def _dismiss_popups(self):
+        """
+        Attempts to dismiss common popups/dialogs on the current page.
+        """
+        max_attempts = 3  # Number of times to attempt popup dismissal
+        wait_time = 5     # Increased wait time to 5 seconds
+        attempts = 0
+
+        try:
+            while attempts < max_attempts:
+                popup_found = False
+
+                # Handle JavaScript alerts
+                try:
+                    WebDriverWait(self.driver, wait_time).until(EC.alert_is_present())
+                    alert = self.driver.switch_to.alert
+                    alert.dismiss()
+                    print("Dismissed JavaScript alert.")
+                    popup_found = True
+                except:
+                    pass
+
+                # Dismiss popups via CSS selectors
+                for selector in self.popup_selectors:
+                    try:
+                        elements = WebDriverWait(self.driver, wait_time).until(
+                            EC.presence_of_all_elements_located((By.CSS_SELECTOR, selector))
+                        )
+                        for element in elements:
+                            if element.is_displayed() and element.is_enabled():
+                                element.click()
+                                print(f"Clicked popup button with selector: {selector}")
+                                time.sleep(0.5)
+                                popup_found = True
+                    except:
+                        continue  # Continue to next selector if none found
+
+                # Dismiss popups via button texts using XPath
+                for text in self.alert_texts:
+                    try:
+                        xpath = f"//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text.lower()}')]"
+                        elements = WebDriverWait(self.driver, wait_time).until(
+                            EC.presence_of_all_elements_located((By.XPATH, xpath))
+                        )
+                        for element in elements:
+                            if element.is_displayed() and element.is_enabled():
+                                element.click()
+                                print(f"Clicked popup button with text: '{text}'")
+                                time.sleep(0.5)
+                                popup_found = True
+                    except:
+                        continue  # Continue to next text if none found
+
+                # Optional: Remove popups via JavaScript
+                self._remove_popups_via_js()
+
+                # Break the loop if no popups were found in this iteration
+                if not popup_found:
+                    break
+
+                attempts += 1
+
+        except Exception as e:
+            print(f"Error while attempting to dismiss popups: {str(e)}")
+
+    def _remove_popups_via_js(self):
+        try:
+            scripts = [
+                "document.querySelectorAll('.overlay, .modal, .popup, #overlay, #modal, #popup').forEach(el => el.remove());",
+                "document.querySelectorAll('div[class*=\"cookie\"], div[class*=\"consent\"], div[class*=\"banner\"]').forEach(el => el.style.display='none');",
+                "document.querySelectorAll('button[class*=\"close\"], button[class*=\"dismiss\"]').forEach(el => el.click());",
+            ]
+            for script in scripts:
+                self.driver.execute_script(script)
+                print("Executed JS to remove popups.")
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"Error executing JS to remove popups: {str(e)}")
+
+
     def setup_driver(self):
         chrome_options = Options()
         chrome_options.add_argument('--headless')
@@ -141,12 +269,20 @@ class ResearchTool(Tool):
         chrome_options.add_argument('--log-level=3')  # Fatal only
         chrome_options.add_argument('--silent')
         chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+
+        # Add the unsafe swiftshader flag
+        chrome_options.add_argument('--enable-unsafe-swiftshader')
         
         service = Service(ChromeDriverManager().install())
         self.driver = webdriver.Chrome(service=service, options=chrome_options)
 
-    def _extract_content(self, url: str, title: str, snippet: str) -> tuple:
+    def _extract_content(self, url: str, title: str, snippet: str, query: str) -> tuple:
         try:
+            image_reading_needed = False
+            self.driver.get(url)
+            print(f"Navigated to URL: {url}")
+            time.sleep(2)  # Wait for the page to load
+
             response = requests.get(url, headers=self.headers, timeout=10)
             response.raise_for_status()
             
@@ -192,9 +328,15 @@ class ResearchTool(Tool):
             
             # Clean up the text
             clean_text = self._clean_text(text_content)
-            
+
+            # If no text content was extracted, set image_reading_needed flag
+            if not clean_text.strip():
+                print(f"No text content extracted from {url}, will defer image reading.")
+                image_reading_needed = True
+                # Do not proceed to _extract_content_with_scrolling()
+              
             # If no date found in meta tags, use GPT to extract date using the full content
-            if not pub_date:
+            if not pub_date and not image_reading_needed:
                 current_date = datetime.datetime.now()
                 pub_date, confidence = self._extract_date_with_gpt(
                     url=url,
@@ -204,11 +346,154 @@ class ResearchTool(Tool):
                     current_date=current_date
                 )
             
-            return clean_text, pub_date, confidence
+            if not image_reading_needed:
+                 # Format and prepend title and date if available
+                formatted_text = f"Title: {title}\n"
+                if pub_date:
+                    formatted_text += f"Date: {pub_date}\n"
+                formatted_text += f"Content:\n{clean_text}\n"
+            
+            # Accumulate the formatted text
+                self.accumulated_extracted_texts.append(formatted_text)
+
+            
+            return clean_text, pub_date, confidence, image_reading_needed
 
         except Exception as e:
             print(f"Error extracting content from {url}: {str(e)}")
-            return "", None, 'low'
+            return "", None, 'low', False
+
+    def _check_continue_interpretation(self, total_info: str, current_page_info: str, query: str) -> bool:
+        try:
+            prompt = (
+                f"Here is the information extracted so far from all pages:\n{total_info}\n\n"
+                f"Here is the information extracted from the current page:\n{current_page_info}\n\n"
+                f"The original query is: '{query}'.\n\n"
+                f"Based on the information extracted, should we perform another image interpretation to extract more information? Say yes if you believe more useful information to help the query is likely to come from the current page."
+                f"Respond with ONLY 'yes - we should do another extraction' or 'no - we've received all of the useful info' and a brief description of your reason."
+            )
+            
+            response = openai_llm_mini.invoke([HumanMessage(content=prompt)])
+            decision = response.content.strip().lower()
+            
+            if 'yes' in decision:
+                print(f"Will do another extraction because {decision}")
+                return True
+                
+            elif 'no' in decision:
+                print(f"Will not do another extraction because {decision}")
+                return False
+            else:
+                # Default to not continue if unclear
+                print("GPT response unclear. Defaulting to stop further interpretations.")
+                return False
+
+        except Exception as e:
+            print(f"Error during GPT decision-making: {str(e)}")
+            # Default to not continue on error
+            return False
+
+    def _extract_content_with_scrolling(self, url: str, query: str) -> str:
+        try:
+            self.driver.get(url)
+            time.sleep(2)  # Wait for the page to load
+
+            extracted_texts = []
+            current_page_image_interpretations = 0
+            max_screens = self.max_interpretations_per_page
+
+            for screen in range(max_screens):
+                if self.total_image_interpretations >= self.max_total_image_interpretations:
+                    print("Reached maximum total image interpretations.")
+                    break
+
+                # Capture screenshot
+                screenshot = self.driver.get_screenshot_as_png()
+                print(f"Captured screenshot {screen + 1} for {url}")
+                
+                # Extract text from the screenshot
+                text = self._extract_text_from_image_with_gpt(screenshot, query=query)
+                if text:
+                    extracted_texts.append(text)
+                    self.total_image_interpretations += 1
+                    current_page_image_interpretations += 1
+                    
+
+                    
+                    # Check with GPT whether to continue
+                    total_info = "\n".join(self.accumulated_extracted_texts)  # Accumulated across all pages
+                    current_page_info = "\n".join(extracted_texts)  # Accumulated on current page
+                    
+                    should_continue = self._check_continue_interpretation(
+                        total_info=total_info,
+                        current_page_info=current_page_info,
+                        query=query
+                    )
+                    
+                    if not should_continue:
+                        print("GPT advised to stop further image interpretations.")
+                        break
+
+                # Scroll down by the viewport height
+                if screen < max_screens - 1:
+                    self._scroll_down()
+                    time.sleep(2)  # Wait for new content to load
+
+            # Combine all extracted texts
+            combined_text = "\n".join(extracted_texts)
+            return combined_text
+
+        except Exception as e:
+            print(f"Error extracting content with scrolling from {url}: {str(e)}")
+            return ""
+
+    def _scroll_down(self):
+        try:
+            # Scroll down by the viewport height
+            scroll_script = "window.scrollBy(0, window.innerHeight);"
+            self.driver.execute_script(scroll_script)
+            print("Scrolled down by one viewport height.")
+        except Exception as e:
+            print(f"Error scrolling down: {str(e)}")
+
+    def _extract_text_from_image_with_gpt(self, image_data: bytes, query: str) -> str:
+        
+        bmp_filename = f"screenshot_{int(time.time())}.bmp"
+        try:
+            # Encode the image data to base64
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+            # Save the image data as a BMP file for debugging
+            image = Image.open(io.BytesIO(image_data))
+            image.save(bmp_filename, format='BMP')
+            print(f"Saved BMP file for debugging: {bmp_filename}")
+
+            # Create the message with the image
+            message = HumanMessage(
+                content=[
+                    {"type": "text", "text": f"Please extract all textual information from this image that is relevant to query:'{query}' and provide it as plain text. Respond with ONLY the extracted text."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+                ]
+            )
+
+            # Invoke the model with the message
+            response = openai_llm_mini.invoke([message])
+
+            # Extract and return the text from the response
+            extracted_text = response.content.strip()
+            print("Extracted text from image.")
+            return extracted_text
+
+        except Exception as e:
+            print(f"Error extracting text from image with GPT: {str(e)}")
+            return ""
+        finally:
+        # Delete the BMP file immediately after processing
+            try:
+                if os.path.exists(bmp_filename):
+                    os.remove(bmp_filename)
+                    print(f"Deleted BMP file: {bmp_filename}")
+            except Exception as del_e:
+                print(f"Error deleting BMP file: {str(del_e)}")
         
     def _clean_text(self, text: str) -> str:
         # Split into lines and clean
@@ -240,10 +525,6 @@ class ResearchTool(Tool):
         try:
             # Build search query
             search_query = query + " -site:youtube.com -site:youtu.be -site:reddit.com -site:washingtonpost.com"
-            #for term in required_terms:
-            #    search_query += f' AND "{term}"'
-            #for term in excluded_terms:
-            #    search_query += f' -"{term}"'
 
             url = f"https://cse.google.com/cse?cx={self.search_engine_id}&q={quote_plus(search_query)}"
             print(f"Searching URL: {url}")
@@ -279,6 +560,7 @@ class ResearchTool(Tool):
             print(f"Found {len(search_results)} results")
             
             results = []
+            deferred_results = []
             processed_urls = set()
             
             for result in search_results:
@@ -304,10 +586,14 @@ class ResearchTool(Tool):
                     title = result['title']
                     snippet = result['snippet']
                     
-                    print(f"Processing URL: {url}")
-                    
-                    full_content, pub_date, confidence = self._extract_content(url, title, snippet)
-                    
+                    print(f"Processing URL: {url}")                    
+                    full_content, pub_date, confidence, image_reading_needed = self._extract_content(url, title, snippet, query=query)
+
+                    if image_reading_needed:
+                        # Defer processing this result
+                        deferred_results.append(result)
+                        continue
+
                     if full_content and len(full_content.split()) > 50:
                         print(f"Adding result for: {url}")
                         results.append({
@@ -324,12 +610,109 @@ class ResearchTool(Tool):
                     print(f"Error processing result: {e}")
                     continue
 
+            print(f"Processed {len(results)} results without image reading")
+            print(f"Deferred {len(deferred_results)} results that require image reading")
+
+            # Decide whether to process deferred results
+            should_process_deferred = self._decide_to_process_deferred(query, time_range)
+
+            if should_process_deferred:
+                print("Proceeding to process deferred results with image reading.")
+                for result in deferred_results:
+                    self._process_deferred_result(result, query)
+            else:
+                print("Skipping processing of deferred results as sufficient information is available.")
+
             print(f"Returning {len(results)} results")
             return results
 
         except Exception as e:
             print(f"Search error: {e}")
             return []
+
+    def _decide_to_process_deferred(self, query: str, time_range: str) -> bool:
+        accumulated_info = "\n".join(self.accumulated_extracted_texts)
+        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        prompt = (
+            f"Given the following query: '{query}', today's date: {current_date}, time sensitivity of the required data: '{time_range}',\n"
+            f"and the information extracted so far:\n"
+            f"{accumulated_info}\n\n"
+            f"Do you have enough information to answer the query confidently?\n"
+            f"Would you benefit from taking significant extra processing time to extract more information from additional sources?\n"
+            f"Respond with 'yes - more info is needed' or 'no - I have enough info' and a brief justification."
+        )
+        response = openai_llm_mini.invoke([HumanMessage(content=prompt)])
+        decision = response.content.strip().lower()
+        if 'yes' in decision:
+            return True
+        elif 'no' in decision:
+            return False
+        else:
+            # Default to False if the response is unclear
+            print("GPT response unclear. Defaulting to not process deferred results.")
+            return False
+
+    def _process_deferred_result(self, result, query):
+        url = result['url']
+        title = result['title']
+        snippet = result['snippet']
+
+        print(f"Processing deferred URL with image reading: {url}")
+        full_content = self._extract_content_with_scrolling(url, query=query)
+        if not full_content.strip():
+            print(f"Could not extract content from {url} even with image reading.")
+            return
+
+        # Accumulate the cleaned text
+        self.accumulated_extracted_texts.append(full_content)
+
+        # Try to extract date
+        pub_date = None
+        confidence = 'low'
+        current_date = datetime.datetime.now()
+        pub_date, confidence = self._extract_date_with_gpt(
+            url=url,
+            title=title,
+            snippet=snippet,
+            content=full_content,
+            current_date=current_date
+        )
+
+        # Add the result to the main results list
+        self.results.append({
+            'url': url,
+            'title': title,
+            'snippet': snippet,
+            'content': full_content,
+            'date': pub_date,
+            'date_confidence': confidence
+        })
+        print(f"Added deferred result for: {url}")
+
+    def _research_func(self, query: str) -> str:
+        try:
+            print("Starting research function with query:", query)
+            # Reset global counters and accumulators at the start of each search
+            self.total_image_interpretations = 0
+            self.accumulated_extracted_texts = []
+            self.results = []  # Initialize results
+
+            refined_query, required_terms, excluded_terms, time_range = self._refine_query(query)
+            print("After refine_query")
+            
+            results = self._google_search(refined_query, required_terms, excluded_terms, time_range)
+            print(f"After google_search, got {len(results)} results")
+            
+            # Process the results as needed
+            json_results = json.dumps(results, indent=True)
+            structured_data = self._post_process(json_results, query)
+            return structured_data
+
+        except Exception as e:
+            print(f"Error in research function: {e}")
+            print(f"Full error details: {traceback.format_exc()}")
+            return f"Error performing research: {str(e)}"
+
 
     def __del__(self):
         """Clean up the Selenium driver"""
@@ -578,6 +961,9 @@ class ResearchTool(Tool):
     def _research_func(self, query: str) -> str:
         try:
             print("Starting research function with query:", query)
+            # Reset global counters and accumulators at the start of each search
+            self.total_image_interpretations = 0
+            self.accumulated_extracted_texts = []
             refined_query, required_terms, excluded_terms, time_range = self._refine_query(query)
             print("After refine_query")
             
@@ -852,8 +1238,11 @@ def should_continue(state: AgentState) -> str:
         nextState = END
     return nextState
 
-def format_messages(messages: List[Union[SystemMessage, HumanMessage, AIMessage]]) -> str:
-    return "\n\n".join([f"{m.content}" for m in messages if not m.content.startswith(TOOLPREFIX)])
+def format_messages(messages: List[Union[SystemMessage, HumanMessage, AIMessage]], suppressToolMsg = True) -> str:
+    if suppressToolMsg:
+        return "\n\n".join([f"{m.content}" for m in messages if not m.content.startswith(TOOLPREFIX)])
+    else:
+        return "\n\n".join([f"{m.content}" for m in messages])
 
 def setup_conversation(setup_info: str):
     # Generate setup using SetupAgent
@@ -891,8 +1280,13 @@ def run_conversation(
     topology_type: str,
     agents_df: List[List[str]],
     moderator_prompt: str,
-    max_iterations: int
-) -> Tuple[str, str]:
+    max_iterations: int,
+    suppress_webpage_popups:bool, 
+    max_image_per_webpage: int, 
+    max_total_image_interpretations:int,
+    suppressResearch:bool,
+    prepare_report: bool
+) -> Tuple[str, str,str]:
     # Convert agents_df to list of dicts
     agents_rows = agents_df.values.tolist()
     agents_list = [{'name': str(row[0]).strip(), 'type': str(row[1]).strip(), 'role': str(row[2]).strip()} 
@@ -905,7 +1299,9 @@ def run_conversation(
     agent_objects = {}
     moderator_agent = None
     moderatorName = ""
-    available_tools = [ResearchTool()]
+    available_tools = [ResearchTool(dismissPopups=suppress_webpage_popups,
+                                    max_interpretations_per_page=max_image_per_webpage, 
+                                    max_total_image_interpretations=max_total_image_interpretations)]
 
     for agent_info in agents_list:
         name = agent_info['name']
@@ -1027,7 +1423,7 @@ def run_conversation(
         agent_state = s[current_agent]
         # Use conversation_messages to build the output
         messages = agent_state.get('conversation_messages', [])
-        output_conversation = format_messages(messages)
+        output_conversation = format_messages(messages, suppressResearch)
         output_debugging = ""
         # Collect debugging info
         if debugme == 1 and 'debugging_info' in agent_state:
@@ -1036,10 +1432,29 @@ def run_conversation(
                 messages_sent = debug_entry['messages_sent']
                 response = debug_entry['response']
                 output_debugging += f"\n\nAgent: {agent_name}\nMessages Sent:\n"
-                output_debugging += format_messages(messages_sent)
+                output_debugging += format_messages(messages_sent, False)
                 output_debugging += f"\n\nResponse:\n{response}"
 
-    return output_conversation, output_debugging
+    if prepare_report:
+        # Construct the conversation transcript
+        conversation_transcript = format_messages(state['conversation_messages'], suppressToolMsg=False)
+
+        # Prepare the prompt for the report
+        report_prompt = (
+            f"Using the following conversation and tool outputs, create a research report designed to answer the question: '{council_question}'.\n"
+            "The report should be very detailed and scientific, presenting uncertainty in a probabilistic fashion, and if necessary, contain subjects for further research or next steps, as appropriate.\n\n"
+            f"Conversation and Tool Outputs:\n{conversation_transcript}"
+        )
+
+        # Generate the report using the LLM
+        report_response = openai_llm.invoke([HumanMessage(content=report_prompt)])
+        report = report_response.content.strip()
+    else:
+        report = ""
+
+
+    return output_conversation, output_debugging, report
+
 
 # Gradio Interface
 with gr.Blocks() as demo:
@@ -1048,8 +1463,14 @@ with gr.Blocks() as demo:
     with gr.Row():
         setup_info_input = gr.Textbox(label="Setup Information", lines=2)
         council_question_input = gr.Textbox(label="Question for the Council", lines=2)
-        setup_button = gr.Button("Generate Setup")
 
+    with gr.Row():
+        suppress_webpage_popups = gr.Checkbox(label="Suppress Webpage Popups (very slow)", value=False)
+        max_image_per_webpage = gr.Number(label="Max Image Interpretations per Webpage", value=4)
+        max_total_image_interpretations = gr.Number(label="Max Total Image Interpretations", value=10)
+        suppress_research = gr.Checkbox(label="Suppress Research in Chat", value=False)
+        prepare_report = gr.Checkbox(label="Prepare Report", value=False)
+        setup_button = gr.Button("Generate Setup")
     with gr.Row():
         topology_dropdown = gr.Dropdown(
             choices=['round_robin', 'last_decides_next', 'moderator_discretionary', 'moderated_round_robin'],
@@ -1083,6 +1504,8 @@ with gr.Blocks() as demo:
 
     conversation_output = gr.Textbox(label="Conversation Output", lines=20)
     debugging_output = gr.Textbox(label="Debugging Output", lines=20, visible=debugme)
+    report_output = gr.Textbox(label="Report", lines=20)  # New output component
+
 
     # Function to populate the setup fields after generating setup
     def populate_setup_fields(setup_result):
@@ -1105,7 +1528,18 @@ with gr.Blocks() as demo:
 
     run_button.click(
         fn=run_conversation,
-        inputs=[setup_info_input, council_question_input, topology_dropdown, agents_dataframe, moderator_prompt_textbox, max_iterations_input],
+        inputs=[
+            setup_info_input, 
+            council_question_input, 
+            topology_dropdown, 
+            agents_dataframe, 
+            moderator_prompt_textbox, 
+            max_iterations_input, 
+            suppress_webpage_popups, 
+            max_image_per_webpage, 
+            max_total_image_interpretations,
+            suppress_research
+        ],
         outputs=[conversation_output, debugging_output]
     )
 
