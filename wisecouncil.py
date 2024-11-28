@@ -3,6 +3,8 @@ from langgraph.graph import Graph, END
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_xai import ChatXAI
 from langchain_community.tools.tavily_search import TavilySearchResults
 import trafilatura
 from googleapiclient.discovery import build
@@ -32,38 +34,75 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from urllib.parse import quote_plus
+from tenacity import retry, stop_after_attempt, wait_exponential
 import traceback
 
 # Debugging flag
 debugme = 1  # Set to 0 to disable debugging window
-moderatorPromptEnd = " Please instruct the best next agent to speak by providing a JSON response with 'next_agent' which names the next agent, using END if the conversation goals are met,'agent_instruction' which addresses the agent by name and guides the conversation, and 'final_thoughts' which sums up the conversation.  ONLY respond with JSON"
+moderatorPromptEnd = (f"Respond in the following JSON format:\n"
+    "{\n"
+    '   "next_agent": "the name of the next agent to speak",\n'
+    '   "agent_instruction": "Name of the next agent followed by instructions to the agent",\n'
+    '   "final_thoughts": "Your final thoughts on the conversation.",\n'
+    "}"
+           
+        )
+
 TOOLPREFIX = "Tool Provided Data:"
 
 def clean_response(content: str) -> str:
     """
-    Cleans the response content by removing code fences, leading/trailing whitespace,
-    and replacing unescaped single quotes within string values.
+    Cleans the response content by:
+    - Removing code fences and JSON labels
+    - Removing outer quotes if present
+    - Fixing invalid escape sequences
+    - Ensuring the string can be parsed as valid JSON
     """
-    # Remove code fences and "json" labels
-    clean_content = content.strip().strip('```').replace("json\n", "").replace("```", "")
+    # Remove code fences and JSON labels
+    content = content.strip()
+    if content.startswith('```'):
+        content = content.strip('`')
+        content = re.sub(r'^json\n', '', content, flags=re.IGNORECASE).strip()
 
-    # Attempt to replace unescaped single quotes only within JSON strings
-    # Note: This approach is more conservative and avoids unwanted escape sequences
+    # Remove outer quotes if present
+    if (content.startswith("'") and content.endswith("'")) or \
+       (content.startswith('"') and content.endswith('"')):
+        content = content[1:-1]
+
+    # Replace invalid escape sequences
+    # Replace \' with '
+    content = content.replace("\\'", "'")
+
+    # Remove any remaining backslashes not part of valid escape sequences
+    # Valid escapes: \", \\, \/, \b, \f, \n, \r, \t, \uXXXX
+    # We'll use a regex to find invalid ones and remove the backslash
+    def fix_invalid_escapes(match):
+        escape = match.group(0)
+        if re.match(r'\\u[0-9a-fA-F]{4}', escape):
+            return escape  # Valid Unicode escape sequence
+        elif escape in ('\\"', '\\\\', '\\/', '\\b', '\\f', '\\n', '\\r', '\\t'):
+            return escape  # Valid escape sequence
+        else:
+            return escape[1:]  # Remove the backslash
+
+    content = re.sub(r'\\.', fix_invalid_escapes, content)
+
+    # Now, try to load the JSON to check if it's valid
     try:
-        # Attempt to parse the JSON to check if it's valid
-        json.loads(clean_content)
-    except json.JSONDecodeError:
-        # If the JSON is invalid, attempt to replace single quotes with double quotes
-        clean_content = clean_content.replace("'", '"')
+        json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"JSON decoding failed: {e.msg} at line {e.lineno} column {e.colno} (char {e.pos})")
 
-    return clean_content
+    return content
 
 # Ensure you have set these environment variables
 os.environ["OPENAI_API_KEY"] = keys.OPENAI_KEY
 os.environ["ANTHROPIC_API_KEY"] = keys.CLAUDE_KEY
 os.environ["TAVILY_API_KEY"] = keys.TAVILY_KEY
 os.environ["GOOGLE_API_KEY"] = keys.GOOGLE_API_KEY
+os.environ["XAI_API_KEY"] = keys.GROK_API_KEY
 os.environ["GOOGLE_SEARCH_ID"] = keys.GOOGLE_SEARCH_ENGINE_ID
+GEMINI_KEY = keys.GEMINI_API_KEY
 
 # Define the state
 class AgentState(TypedDict, total=False):
@@ -85,12 +124,40 @@ class AgentState(TypedDict, total=False):
     # Removed 'last_conversation'
     moderatorName: str
 
-# Initialize LLMs
-openai_llm = ChatOpenAI(model="gpt-4o", temperature=0)
-openai_llm_mini = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-claude_llm = ChatAnthropic(model_name="claude-3-5-sonnet-20240620", temperature=0)
 
+class RetryLLM:
+    def __init__(self, llm, max_attempts: int = 3, min_wait: float = 1, max_wait: float = 10):
+        self.llm = llm
+        self.max_attempts = max_attempts
+        self.min_wait = min_wait
+        self.max_wait = max_wait
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True
+    )
+    def invoke(self, *args: Any, **kwargs: Any) -> Any:
+        return self.llm.invoke(*args, **kwargs)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True
+    )
+    def batch(self, *args: Any, **kwargs: Any) -> Any:
+        return self.llm.batch(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.llm, name)
+
+# Initialize your LLMs with retry wrapper
+openai_llm = RetryLLM(ChatOpenAI(model="gpt-4o", temperature=0))
+openai_llm_mini = RetryLLM(ChatOpenAI(model="gpt-4o-mini", temperature=0))
+claude_llm = RetryLLM(ChatAnthropic(model_name="claude-3-5-sonnet-20240620", temperature=0))
+gemini_llm = RetryLLM(ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0,api_key=GEMINI_KEY))
+grok_llm = RetryLLM(ChatXAI(model="grok-beta", temperature=0))
 # Available LLMs with descriptions
 available_llms = [
     {
@@ -103,6 +170,16 @@ available_llms = [
         "description": "Anthropic's Claude model, a best-in-class foundation model capable of general use.",
         "llm": claude_llm
     },
+    # {
+    #    "name": "google_gemini",
+    #    "description": "Google's Gemini model, a state-of-the-art multimodal AI model.",
+    #    "llm": gemini_llm
+    #},
+     {
+        "name": "xai_grok",
+        "description": "xAI's Grok model, an AI chatbot integrated with X. Best for espousing controversial viewpoints.",
+        "llm": grok_llm
+    }
 
 ]
 
@@ -558,73 +635,77 @@ class ResearchTool(Tool):
             
             search_results = self.driver.execute_script(js_script)
             print(f"Found {len(search_results)} results")
-            
-            results = []
-            deferred_results = []
-            processed_urls = set()
-            
-            for result in search_results:
-                try:
-                    url = result['url']
-                    if not url or not url.startswith('http'):
-                        continue
+            if (len(search_results) >0):
+                
+                results = []
+                deferred_results = []
+                processed_urls = set()
+                
+                for result in search_results:
+                    try:
+                        url = result['url']
+                        if not url or not url.startswith('http'):
+                            continue
+                            
+                        if url in processed_urls:
+                            continue
+                            
+                        processed_urls.add(url)
                         
-                    if url in processed_urls:
-                        continue
+                        if any(domain in url.lower() for domain in [
+                            'youtube.com', 
+                            'youtu.be',
+                            'vimeo.com',
+                            'dailymotion.com',
+                            'tiktok.com'
+                        ]):
+                            continue
                         
-                    processed_urls.add(url)
-                    
-                    if any(domain in url.lower() for domain in [
-                        'youtube.com', 
-                        'youtu.be',
-                        'vimeo.com',
-                        'dailymotion.com',
-                        'tiktok.com'
-                    ]):
-                        continue
-                    
-                    title = result['title']
-                    snippet = result['snippet']
-                    
-                    print(f"Processing URL: {url}")                    
-                    full_content, pub_date, confidence, image_reading_needed = self._extract_content(url, title, snippet, query=query)
-
-                    if image_reading_needed:
-                        # Defer processing this result
-                        deferred_results.append(result)
-                        continue
-
-                    if full_content and len(full_content.split()) > 50:
-                        print(f"Adding result for: {url}")
-                        results.append({
-                            'url': url,
-                            'title': title,
-                            'snippet': snippet,
-                            'content': full_content,
-                            'date': pub_date,
-                            'date_confidence': confidence
-                        })
-                        print(f"Current results count: {len(results)}")
+                        title = result['title']
+                        snippet = result['snippet']
                         
-                except Exception as e:
-                    print(f"Error processing result: {e}")
-                    continue
+                        print(f"Processing URL: {url}")                    
+                        full_content, pub_date, confidence, image_reading_needed = self._extract_content(url, title, snippet, query=query)
 
-            print(f"Processed {len(results)} results without image reading")
-            print(f"Deferred {len(deferred_results)} results that require image reading")
+                        if image_reading_needed:
+                            # Defer processing this result
+                            deferred_results.append(result)
+                            continue
 
-            # Decide whether to process deferred results
-            should_process_deferred = self._decide_to_process_deferred(query, time_range)
+                        if full_content and len(full_content.split()) > 50:
+                            print(f"Adding result for: {url}")
+                            results.append({
+                                'url': url,
+                                'title': title,
+                                'snippet': snippet,
+                                'content': full_content,
+                                'date': pub_date,
+                                'date_confidence': confidence
+                            })
+                            print(f"Current results count: {len(results)}")
+                            
+                    except Exception as e:
+                        print(f"Error processing result: {e}")
+                        continue
 
-            if should_process_deferred:
-                print("Proceeding to process deferred results with image reading.")
-                for result in deferred_results:
-                    self._process_deferred_result(result, query)
+                print(f"Processed {len(results)} results without image reading")
+                print(f"Deferred {len(deferred_results)} results that require image reading")
+
+                # Decide whether to process deferred results
+                should_process_deferred = self._decide_to_process_deferred(query, time_range)
+
+                if should_process_deferred:
+                    print("Proceeding to process deferred results with image reading.")
+                    for result in deferred_results:
+                        self._process_deferred_result(result, query)
+                else:
+                    print("Skipping processing of deferred results as sufficient information is available.")
+
+                print(f"Returning {len(results)} results")
+                return results
             else:
-                print("Skipping processing of deferred results as sufficient information is available.")
-
-            print(f"Returning {len(results)} results")
-            return results
+                print("Google search needs to have not a robot clicked, exiting")
+                exit()
 
         except Exception as e:
             print(f"Search error: {e}")
@@ -703,9 +784,8 @@ class ResearchTool(Tool):
             results = self._google_search(refined_query, required_terms, excluded_terms, time_range)
             print(f"After google_search, got {len(results)} results")
             
-            # Process the results as needed
-            json_results = json.dumps(results, indent=True)
-            structured_data = self._post_process(json_results, query)
+            
+            structured_data = self._post_process(results, query)
             return structured_data
 
         except Exception as e:
@@ -804,8 +884,8 @@ class ResearchTool(Tool):
 
     def _post_process(self, json_results: str, query: str) -> str:
         try:
-            results = json.loads(json_results)
-            cleaned_results = self._clean_results(results)
+
+            cleaned_results = self._clean_results(json_results)
              # Sort results by date confidence and actual date
             current_date = datetime.datetime.now()
             for result in cleaned_results:
@@ -833,7 +913,7 @@ class ResearchTool(Tool):
             # Determine temporal requirements based on query
             temporal_prompt = (
                 f"Analyze this query and determine its temporal requirements: '{query}'\n"
-                f"Respond in JSON format:\n"
+                f"Respond ONLY in JSON format:\n"
                 "{\n"
                 '    "recency_importance": "critical/high/medium/low",\n'
                 '    "max_age_days": number,\n'
@@ -970,26 +1050,10 @@ class ResearchTool(Tool):
             results = self._google_search(refined_query, required_terms, excluded_terms, time_range)
             print(f"After google_search, got {len(results)} results")
             
-            # Filter results for relevancy
-            '''
-            filtered_results = []
-            for result in results:
-                try:  # Add try-except here
-                    content = (result['content'] + ' ' + result['title']).lower()
-                    
-                    # Check if content matches required terms and doesn't contain excluded terms
-                    if all(term.lower() in content for term in required_terms) and \
-                    not any(term.lower() in content for term in excluded_terms):
-                        filtered_results.append(result)
-                except Exception as e:
-                    print(f"Error filtering result: {e}")
-                    continue
-            
-            print(f"After filtering, have {len(filtered_results)} results")
-            '''
+           
             try:  # Add try-except here
-                json_results = json.dumps(results, indent=True)
-                structured_data = self._post_process(json_results, query)
+
+                structured_data = self._post_process(results, query)
                 return structured_data
             except Exception as e:
                 print(f"Error in post-processing: {e}")
@@ -1018,11 +1082,26 @@ class BaseAgent:
             base_message += "Available tools:\n"
             for tool in self.available_tools:
                 base_message += f"- {tool.name}: {tool.description}\n"
- 
+        '''
         base_message += "\nYou must respond with ONLY a JSON object containing:\n"
         base_message += "- 'thought': your reasoning process\n"
-        base_message += "- 'response': your response to the conversation\n"
+        base_message += "- 'response': your response to the conversation which should be in narrative form (not nested JSON) \n"
         base_message += "- 'tool_calls': (optional, use tools if response would benefit materially from current info) list of tools to invoke, each with 'tool_name' and 'tool_input'\n"
+        base_message +="Reminder, response ONLY with JSON. \n"
+        return base_message
+        '''
+        base_message += "\nYou must respond with ONLY a valid JSON object using the following strict formatting rules:\n"
+        base_message += "1. Use double quotes (not single quotes) for all JSON keys and string values\n"
+        base_message += "2. For newlines in strings, use the escaped sequence '\\n' (not actual line breaks)\n"
+        base_message += "3. The JSON object must contain these exact keys:\n"
+        base_message += "   - 'thought': your reasoning process as a single-line string\n"
+        base_message += "   - 'response': your response as a single-line string (use '\\n' for paragraph breaks)\n"
+        base_message += "   - 'tool_calls': (optional) array of objects with 'tool_name' and 'tool_input' strings\n"
+        base_message += "4. Do not include any markdown formatting or code blocks\n"
+        base_message += "5. Do not wrap the JSON in quotes or backticks\n"
+        base_message += "Example format:\n"
+        base_message += '{"thought":"reasoning here","response":"first paragraph\\n\\nsecond paragraph","tool_calls":[]}\n'
+        base_message += "Ensure your response is exactly one JSON object that can be parsed by JSON.parse()\n"
         return base_message
 
     def _invoke_tools(self, tool_calls: List[Dict], state: AgentState) -> List[Dict]:
@@ -1040,21 +1119,23 @@ class BaseAgent:
                 })
         return tool_results
 
-    def _process_response(self, response_text: str, state: AgentState, retry_count: int = 0) -> Tuple[str, List[Dict]]:
-        MAX_RETRIES=3
+    def _process_response(self, response_text: str, state: AgentState, retry_count: int = 0) -> Tuple[Dict, List[Dict]]:
+
         try:
             response_data = json.loads(clean_response(response_text))
+
             tool_calls = response_data.get('tool_calls', [])
-            toolResponse = ""
+            tool_results = []
             
             if tool_calls:
-                # Execute tool calls and get result text
+                # Execute tool calls and get results
                 tool_results = self._invoke_tools(tool_calls, state)
                 
                 # Create updated context as a single ToolMessage
+                tool_outputs = "\\n".join([tr['tool_result'] for tr in tool_results])
                 updated_context = (
                     f"Previous AI thought: {response_data.get('thought', '')}\n"
-                    f"AI Tool results of thought: {tool_results[0]['tool_result']}"
+                    f"AI Tool results of thought: {tool_outputs}"
                 )
                 
                 # Re-run LLM with updated context
@@ -1067,24 +1148,13 @@ class BaseAgent:
                 new_response = self.llm.invoke(messages)
                 final_answer = new_response.content
                 response_data = json.loads(clean_response(new_response.content))
-                toolResponse = TOOLPREFIX + tool_results[0]['tool_result'] 
-
+    
             else:
-
                 messages = [
                     SystemMessage(content=self.system_message),
                     *state['conversation_messages'],
-
                 ]
                 final_answer = response_text
-                
-                      
-
-            if 'response' not in response_data:
-                if retry_count < MAX_RETRIES:
-                    return self._process_response(response_text, state, retry_count + 1)
-                else:
-                    raise ValueError(f"No response key found after {MAX_RETRIES} attempts")
                 
             # Add to debugging info with complete chain
             if 'debugging_info' not in state:
@@ -1094,14 +1164,15 @@ class BaseAgent:
                 'messages_sent': messages,
                 'response': f"Final response: {final_answer}"
             })
-                
-            
-            return response_data['response'], toolResponse
-            
+
+            return response_data, tool_results
+
         except json.JSONDecodeError:
-            return f"Error: Invalid JSON response from {self.name}", []
+            return {"error": f"Error: Invalid JSON response from {self.name}"}, []
         except ValueError as e:
-            return f"Error: {str(e)}", []
+            return {"error": f"Error: {str(e)}"}, []
+            
+
 
 class FeedbackAgent(BaseAgent):
     def __init__(self, name: str, llm, role: str, topology: str, agent_names: List[str], available_tools: List[Tool]):
@@ -1111,28 +1182,52 @@ class FeedbackAgent(BaseAgent):
         if topology == 'last_decides_next':
             self.system_message += "\n- 'next_agent': the name of the next agent to speak"
 
+    def _process_response(self, response_text: str, state: AgentState, retry_count: int = 0) -> Tuple[Dict, List[Dict]]:
+        MAX_RETRIES = 3
+        response_data, tool_results = super()._process_response(response_text, state, retry_count)
+        if 'error' in response_data:
+            return response_data, tool_results
+        if 'response' not in response_data:
+            if retry_count < MAX_RETRIES:
+                return self._process_response(response_text, state, retry_count + 1)
+            else:
+                return {"error": f"Error: No 'response' key found after {MAX_RETRIES} attempts"}, tool_results
+        return response_data, tool_results
+
     def generate_response(self, state: AgentState) -> AgentState:
         messages = [SystemMessage(content=self.system_message)] + state['conversation_messages']
         response = self.llm.invoke(messages)
         
         # Process response and handle any tool calls
-        final_response, tool_results = self._process_response(response.content, state)
+        response_data, tool_results = self._process_response(response.content, state)
         
-        # Add final response to conversation
-        response_message = f"{self.name}: {final_response}"
+        if 'error' in response_data:
+            # Handle error
+            state['conversation_messages'].append(
+                AIMessage(content=f"{self.name}: {response_data['error']}")
+            )
+            state['nextAgent'] = 'END'
+            return state
+        
+        # Add tool results to conversation
         if tool_results:
-            state['conversation_messages'].append(AIMessage(content=tool_results))
+            for tool_result in tool_results:
+                tool_message = f"{TOOLPREFIX}{tool_result['tool_result']}"
+                state['conversation_messages'].append(AIMessage(content=tool_message))
+
+        # Add final response to conversation
+        response_message = f"{self.name}: {response_data['response']}"
         state['conversation_messages'].append(HumanMessage(content=response_message))
 
-        
         # Handle next agent selection based on topology
         if self.topology == 'last_decides_next':
-            response_data = json.loads(clean_response(response.content))
             next_agent = response_data.get('next_agent')
-            if next_agent and next_agent in [agent['name'] for agent in self.agent_names]:
+            if next_agent and next_agent in [agent for agent in self.agent_names]:
                 state['saved_next_agent'] = next_agent
             else:
                 state['nextAgent'] = 'END'
+        elif 'moderator' in self.topology.lower():
+            state['nextAgent']="Moderator"
         
         return state
 
@@ -1146,24 +1241,50 @@ class ModeratorAgent(BaseAgent):
         self.system_message = setup['moderator_prompt']
         self.agent_names = [agent['name'] for agent in setup['agents']]
 
+    def _process_response(self, response_text: str, state: AgentState, retry_count: int = 0) -> Tuple[Dict, List[Dict]]:
+        MAX_RETRIES = 3
+        response_data, tool_results = super()._process_response(response_text, state, retry_count)
+        if 'error' in response_data:
+            return response_data, tool_results
+        # For Moderator, expected keys are 'next_agent', 'agent_instruction', 'final_thoughts'
+        required_keys = ['next_agent', 'agent_instruction', 'final_thoughts']
+        missing_keys = [key for key in required_keys if key not in response_data]
+        if missing_keys:
+            if retry_count < MAX_RETRIES:
+                return self._process_response(response_text, state, retry_count + 1)
+            else:
+                return {"error": f"Error: Missing keys {missing_keys} after {MAX_RETRIES} attempts"}, tool_results
+        return response_data, tool_results
+
     def generate_response(self, state: AgentState) -> AgentState:
         messages = [SystemMessage(content=self.system_message)] + state['conversation_messages']
         response = self.llm.invoke(messages)
         
         # Process response and handle any tool calls
-        final_response, tool_results = self._process_response(response.content, state)
+        response_data, tool_results = self._process_response(response.content, state)
         
-        # Parse the final response JSON
-        response_data = json.loads(clean_response(final_response))
-        
+        if 'error' in response_data:
+            # Handle error
+            state['conversation_messages'].append(
+                AIMessage(content=f"{self.name}: {response_data['error']}")
+            )
+            state['nextAgent'] = 'END'
+            return state
+
+        # Add tool results to conversation
+        if tool_results:
+            for tool_result in tool_results:
+                tool_message = f"{TOOLPREFIX}{tool_result['tool_result']}"
+                state['conversation_messages'].append(AIMessage(content=tool_message))
+
         if state['nextAgent'].upper() == 'END' and response_data.get('final_thoughts'):
             state['conversation_messages'].append(
-                AIMessage(content=f"{state['moderatorName']}: {response_data['final_thoughts']}")
+                AIMessage(content=f"{self.name}: {response_data['final_thoughts']}")
             )
             state['nextAgent'] = 'END'
         else:
             state['conversation_messages'].append(
-                HumanMessage(content=f"{state['moderatorName']}: {response_data['agent_instruction']}")
+                HumanMessage(content=f"{self.name}: {response_data['agent_instruction']}")
             )
             state['nextAgent'] = response_data.get('next_agent', 'END')
         
@@ -1192,13 +1313,18 @@ class SetupAgent:
             f"d) moderated_round_robin - with moderator\n\n"
             f"Provide a JSON configuration that includes:\n"
             f"1. 'topology_type': One of 'round_robin', 'last_decides_next', 'moderator_discretionary', 'moderated_round_robin'.\n"
-            f"2. 'agents': A list of agents (including the Moderator agent, if applicable), each with:\n"
-            f"   - 'name': The agent's friendly name.\n"
-            f"   - 'type': The LLM to use (from the available agents).\n"
-            f"   - 'role': The system prompt for the agent that describes who the agent is. \n"
+            f"2. 'agents': A list of agents where:\n"
+            f"   - If topology_type is 'moderator_discretionary' or 'moderated_round_robin', the first agent MUST be the moderator agent with:\n"
+            f"     * 'name': 'Moderator'\n"
+            f"     * 'type': The LLM to use for the moderator\n"
+            f"     * 'role': A system prompt describing the moderator's role\n"
+            f"   - For all other agents (and all agents in non-moderated topologies):\n"
+            f"     * 'name': The agent's friendly name\n"
+            f"     * 'type': The LLM to use (from the available agents)\n"
+            f"     * 'role': The system prompt for the agent that describes who the agent is\n"
             f"3. If the topology type includes a moderator, include 'moderator_prompt': A proposed system prompt for the moderator, which includes how the moderator should focus the discussion, the names and roles (not model type) of the agents, the goal for feedback agent participation order.\n\n"
             f"Please return the JSON without any additional text or formatting."
-        )
+)
 
         response = self.llm.invoke([HumanMessage(content=prompt)])
         try:
@@ -1219,7 +1345,7 @@ class SetupAgent:
         # Prepare the prompt
         prompt = (
             f"You are a setup agent. Based on the following setup information: '{setup_info}', the topology type '{topology_type}', and the agents:\n{agents_str}\n\n"
-            f"Generate a proposed system prompt for the moderator, which includes the goal for the discussion, the goal for feedback agent participation order, and how to instruct the agents to return a JSON response with 'next_agent' and 'agent_instruction'.\n\n"
+            f"Generate a proposed system prompt for the moderator, which includes the goal for the discussion, the goal for feedback agent participation order.\n\n"
             f"Please return the moderator prompt without any additional text or formatting."
         )
 
@@ -1285,7 +1411,8 @@ def run_conversation(
     max_image_per_webpage: int, 
     max_total_image_interpretations:int,
     suppressResearch:bool,
-    prepare_report: bool
+    prepare_report: bool,
+    reporterPrompt: str
 ) -> Tuple[str, str,str]:
     # Convert agents_df to list of dicts
     agents_rows = agents_df.values.tolist()
@@ -1438,14 +1565,13 @@ def run_conversation(
     if prepare_report:
         # Construct the conversation transcript
         conversation_transcript = format_messages(state['conversation_messages'], suppressToolMsg=False)
-
+        # Replace placeholder in reporterPrompt with actual council_question
+        report_prompt = reporterPrompt.replace("[council question]", council_question)
         # Prepare the prompt for the report
         report_prompt = (
-            f"Using the following conversation and tool outputs, create a research report designed to answer the question: '{council_question}'.\n"
-            "The report should be very detailed and scientific, presenting uncertainty in a probabilistic fashion, and if necessary, contain subjects for further research or next steps, as appropriate.\n\n"
+            f"{report_prompt}\n\n"
             f"Conversation and Tool Outputs:\n{conversation_transcript}"
         )
-
         # Generate the report using the LLM
         report_response = openai_llm.invoke([HumanMessage(content=report_prompt)])
         report = report_response.content.strip()
@@ -1459,10 +1585,11 @@ def run_conversation(
 # Gradio Interface
 with gr.Blocks() as demo:
     gr.Markdown("## Wise Council")
-
+    reporterPrompt = '''Using the following conversation and tool outputs, create a research report designed to answer the question: [council question].\n The report should be very detailed and scientific, presenting uncertainty in a probabilistic fashion, and if necessary, contain subjects for further research or next steps, as appropriate.'''
     with gr.Row():
         setup_info_input = gr.Textbox(label="Setup Information", lines=2)
         council_question_input = gr.Textbox(label="Question for the Council", lines=2)
+        report_instructions = gr.Textbox(label="Prompt for reporter", value = reporterPrompt,lines=2)
 
     with gr.Row():
         suppress_webpage_popups = gr.Checkbox(label="Suppress Webpage Popups (very slow)", value=False)
@@ -1538,9 +1665,11 @@ with gr.Blocks() as demo:
             suppress_webpage_popups, 
             max_image_per_webpage, 
             max_total_image_interpretations,
-            suppress_research
+            suppress_research,
+            prepare_report,
+            report_instructions
         ],
-        outputs=[conversation_output, debugging_output]
+        outputs=[conversation_output, debugging_output, report_output]
     )
 
 demo.launch(share=False)
