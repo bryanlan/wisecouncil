@@ -53,6 +53,7 @@ class ResearchTool(Tool):
         self.setup_driver()
         self.service = build("customsearch", "v1", developerKey=self.api_key)
         self.dismissPopups = dismissPopups
+        self.MIN_SEARCH_RESULTS = 6  # New constant for minimum search results
         
         # Common problematic domains that might block scraping
         self.headers = {
@@ -98,6 +99,7 @@ class ResearchTool(Tool):
         self.total_image_interpretations = 0
         # Initialize extracted texts accumulator
         self.accumulated_extracted_texts = []  # Accumulates all extracted texts per search
+        self.has_successful_search = False  # Add this line
 
 
     
@@ -449,8 +451,8 @@ class ResearchTool(Tool):
     def _google_search(self, query: str, required_terms: list, excluded_terms: list, time_range: str, num_results: int = 10):
         print(f"Starting google_search with query: {query}") 
         try:
-            # Build search query
-            search_query = query + " -site:youtube.com -site:youtu.be -site:reddit.com -site:washingtonpost.com"
+            # Build initial search query with quotes
+            search_query = f'"{query}" -site:youtube.com -site:youtu.be -site:washingtonpost.com'
 
             url = f"https://cse.google.com/cse?cx={self.search_engine_id}&q={quote_plus(search_query)}"
             print(f"Searching URL: {url}")
@@ -484,8 +486,24 @@ class ResearchTool(Tool):
             
             search_results = self.driver.execute_script(js_script)
             print(f"Found {len(search_results)} results")
-            if (len(search_results) >0):
+
+            # If results are less than MIN_SEARCH_RESULTS, retry without quotes
+            if len(search_results) < self.MIN_SEARCH_RESULTS:
+                print(f"Found fewer than {self.MIN_SEARCH_RESULTS} results, retrying without quotes")
+                search_query = f"{query} -site:youtube.com -site:youtu.be -site:washingtonpost.com"
+                url = f"https://cse.google.com/cse?cx={self.search_engine_id}&q={quote_plus(search_query)}"
+                print(f"Retrying with URL: {url}")
                 
+                self.driver.get(url)
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "gsc-result"))
+                )
+                time.sleep(3)
+                search_results = self.driver.execute_script(js_script)
+                print(f"Found {len(search_results)} results after retrying without quotes")
+
+            if len(search_results) > 0:
+                self.has_successful_search = True  # Mark that we've had a successful search
                 results = []
                 deferred_results = []
                 processed_urls = set()
@@ -553,11 +571,18 @@ class ResearchTool(Tool):
                 print(f"Returning {len(results)} results")
                 return results
             else:
-                print("Google search needs to have not a robot clicked, exiting")
-                exit()
+                if not self.has_successful_search:
+                    print("Google search detected robot - no previous successful searches, exiting immediately")
+                    os._exit(1)  # Force immediate exit
+                else:
+                    print("Google search detected robot but has previous successful searches - returning empty results")
+                    return []
 
         except Exception as e:
             print(f"Search error: {e}")
+            if not self.has_successful_search:
+                print("Error during search with no previous successful searches - exiting immediately")
+                os._exit(1)  # Force immediate exit
             return []
 
     def _decide_to_process_deferred(self, query: str, time_range: str) -> bool:

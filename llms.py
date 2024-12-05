@@ -52,11 +52,11 @@ available_llms = [
         "description": "Anthropic's Claude model, a best-in-class foundation model capable of general use.",
         "llm": claude_llm
     },
-    # {
-    #    "name": "google_gemini",
-    #    "description": "Google's Gemini model, a state-of-the-art multimodal AI model.",
-    #    "llm": gemini_llm
-    # },
+     {
+        "name": "google_gemini",
+        "description": "Google's Gemini model, a state-of-the-art multimodal AI model.",
+        "llm": gemini_llm
+     },
     {
         "name": "xai_grok",
         "description": "xAI's Grok model, an AI chatbot integrated with X. Best for espousing controversial viewpoints.",

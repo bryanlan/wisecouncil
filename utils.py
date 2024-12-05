@@ -60,4 +60,8 @@ def should_continue(state):
     nextState = state.get('nextAgent', 'END')
     if nextState.upper() == 'END':
         nextState = END
+    if nextState is None or nextState =='none':
+        ProblemState = True
+        nextState = END
+
     return nextState

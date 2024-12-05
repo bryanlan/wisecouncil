@@ -34,6 +34,7 @@ class BaseAgent:
         base_message += "   - 'thought': your reasoning process as a single-line string\n"
         base_message += "   - 'response': your response as a single-line string (use '\\n' for paragraph breaks)\n"
         base_message += "   - 'tool_calls': (optional) array of objects with 'tool_name' and 'tool_input' strings\n"
+        base_message += "   - 'next_agent': the name of the next agent to speak, or 'END' if the conversation is complete\n"
         base_message += "4. Do not include any markdown formatting or code blocks\n"
         base_message += "5. Do not wrap the JSON in quotes or backticks\n"
         base_message += "Example format:\n"
@@ -113,8 +114,7 @@ class FeedbackAgent(BaseAgent):
         super().__init__(name, llm, role, available_tools)
         self.topology = topology
         self.agent_names = agent_names
-        if topology == 'last_decides_next':
-            self.system_message += "\n- 'next_agent': the name of the next agent to speak"
+        
 
     def _process_response(self, response_text: str, state: AgentState, retry_count: int = 0) -> Tuple[Dict, List[Dict]]:
         MAX_RETRIES = 3
@@ -132,8 +132,27 @@ class FeedbackAgent(BaseAgent):
         messages = [SystemMessage(content=self.system_message)] + state['conversation_messages']
         response = self.llm.invoke(messages)
 
-        # Process response and handle any tool calls
-        response_data, tool_results = self._process_response(response.content, state)
+        max_retries = 3
+        attempt = 0
+
+        response_data = None
+        tool_results = None
+        while attempt < max_retries:
+            try:
+                # Process response and handle any tool calls
+                response_data, tool_results = self._process_response(response.content, state)
+                break  # Exit the loop if successful
+            except Exception as e:
+                attempt += 1
+                print(f"Attempt {attempt} failed in _process_response: {e}")
+                
+                if attempt < max_retries:
+                    print("Retrying...")
+                    response = self.llm.invoke(messages)  # Reinvoke the LLM
+                else:
+                    print("Max retries reached. Raising the exception.")
+                    raise  # Re-raise the exception if max retries are exceeded
+
 
         if 'error' in response_data:
             # Handle error
@@ -157,10 +176,10 @@ class FeedbackAgent(BaseAgent):
         if self.topology == 'last_decides_next':
             next_agent = response_data.get('next_agent')
             if next_agent and next_agent in [agent for agent in self.agent_names]:
-                state['saved_next_agent'] = next_agent
+                state['next_agent'] = next_agent
             else:
                 state['nextAgent'] = 'END'
-        elif 'moderator' in self.topology.lower():
+        elif 'moderator' in self.topology.lower() or 'moderated' in self.topology.lower():
             state['nextAgent'] = "Moderator"
 
         return state
@@ -194,8 +213,26 @@ class ModeratorAgent(BaseAgent):
         messages = [SystemMessage(content=self.system_message)] + state['conversation_messages']
         response = self.llm.invoke(messages)
 
-        # Process response and handle any tool calls
-        response_data, tool_results = self._process_response(response.content, state)
+        max_retries = 3
+        attempt = 0
+
+        response_data = None
+        tool_results = None
+        while attempt < max_retries:
+            try:
+                # Process response and handle any tool calls
+                response_data, tool_results = self._process_response(response.content, state)
+                break  # Exit the loop if successful
+            except Exception as e:
+                attempt += 1
+                print(f"Attempt {attempt} failed in _process_response: {e}")
+                
+                if attempt < max_retries:
+                    print("Retrying...")
+                    response = self.llm.invoke(messages)  # Reinvoke the LLM
+                else:
+                    print("Max retries reached. Raising the exception.")
+                    raise  # Re-raise the exception if max retries are exceeded
 
         if 'error' in response_data:
             # Handle error
@@ -239,8 +276,8 @@ class SetupAgent:
             f"Determine how many agents are needed, what specific and complimentary roles they should play, and assign LLMs accordingly. Do not use a moderator unless one is specifically requested."
             f"Pick a topology type from the following options:\n"
             f"a) round_robin - no moderator\n"
-            f"b) last_decides_next - no moderator\n"
-            f"c) moderator_discretionary - with moderator\n"
+            f"b) last_decides_next - no moderator, the last agent decides the next agent based on context\n"
+            f"c) moderator_discretionary - with moderator, the moderator decides the next agent based on context\n"
             f"d) moderated_round_robin - with moderator\n\n"
             f"Provide a JSON configuration that includes:\n"
             f"1. 'topology_type': One of 'round_robin', 'last_decides_next', 'moderator_discretionary', 'moderated_round_robin'.\n"

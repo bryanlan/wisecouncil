@@ -84,10 +84,10 @@ def run_conversation(
                                     max_total_image_interpretations=max_total_image_interpretations)]
 
     for agent_info in agents_list:
-        name = agent_info['name']
+        name =   agent_info['name']
         llm_type = agent_info['type']
         role = agent_info['role']
-        isModerator = ('moderator' in role.lower() or 'moderator' in name.lower() or 'moderate' in role.lower())
+        isModerator = ('moderator' in name.lower())
 
         # Find the LLM object
         llm = next((available_llm['llm'] for available_llm in available_llms if available_llm['name'] == llm_type), None)
@@ -140,11 +140,11 @@ def run_conversation(
 
     elif topology_type == 'last_decides_next':
         # Add FeedbackAgent nodes and conditional edges
-        first_agent_name = agent_objects.keys()[0]
+        first_agent_name = next(iter(agent_objects.keys()))
         for agent_name, feedback_agent in agent_objects.items():
             workflow.add_node(agent_name, feedback_agent.generate_response)
             workflow.add_conditional_edges(agent_name, should_continue)
-    
+        workflow.set_entry_point(first_agent_name)
     elif topology_type in ['moderator_discretionary', 'moderated_round_robin']:
         # Add the moderator node and FeedbackAgent nodes
         workflow.add_node(moderatorName, moderator_agent.generate_response)
@@ -193,9 +193,11 @@ def run_conversation(
 
     output_conversation = ""
   
-    
-    for i, s in enumerate(chain.stream(state)):
+    config = {"recursion_limit": 50}
+    for i, s in enumerate(chain.stream(state, config=config )):
         if i >= max_iterations:
+            break
+        if "__end__" in s or state['nextAgent'] == 'none':
             break
 
         # Collect messages
@@ -274,7 +276,7 @@ with gr.Blocks() as demo:
     with gr.Row():
         max_iterations_input = gr.Slider(
             minimum=1,
-            maximum=20,
+            maximum=40,
             step=1,
             value=5,
             label="Max Iterations"
