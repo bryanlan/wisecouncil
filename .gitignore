@@ -6,3 +6,5 @@ test.py
 __pycache__
 .vscode
 flagged
+/temp
+/boneyard
