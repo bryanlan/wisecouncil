@@ -1,6 +1,6 @@
 # tools.py
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import time
 import base64
 import os
@@ -53,7 +53,8 @@ class ResearchTool(Tool):
         self.setup_driver()
         self.service = build("customsearch", "v1", developerKey=self.api_key)
         self.dismissPopups = dismissPopups
-        self.MIN_SEARCH_RESULTS = 6  # New constant for minimum search results
+        self.MIN_RESULTS = 3  # Minimum number of results to process
+        self.MAX_RESULTS = 10  # Maximum number of results to process
         
         # Common problematic domains that might block scraping
         self.headers = {
@@ -448,141 +449,149 @@ class ResearchTool(Tool):
         text = ' '.join(text.split())
         
         return text
-    def _google_search(self, query: str, required_terms: list, excluded_terms: list, time_range: str, num_results: int = 10):
-        print(f"Starting google_search with query: {query}") 
+    def _google_search(self, query: str, required_terms: list, excluded_terms: list, time_range: str, num_results: int = None):
+        print(f"Starting google_search with query: {query}")
+        all_results = []
+        processed_urls = set()
+        page_count = 0
+        max_pages = 3  # Maximum number of pages to try
+        
+        # Use provided num_results or default to MAX_RESULTS
+        target_results = num_results if num_results is not None else self.MAX_RESULTS
+        
         try:
             # Build initial search query with quotes
             search_query = f'"{query}" -site:youtube.com -site:youtu.be -site:washingtonpost.com'
-
             url = f"https://cse.google.com/cse?cx={self.search_engine_id}&q={quote_plus(search_query)}"
-            print(f"Searching URL: {url}")
             
             self.driver.get(url)
             
-            # Wait for results
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.CLASS_NAME, "gsc-result"))
-            )
-            
-            time.sleep(3)
-
-            # Use JavaScript to extract the results
-            js_script = """
-            const results = [];
-            const elements = document.querySelectorAll('.gsc-result');
-            elements.forEach(element => {
-                const titleElement = element.querySelector('a.gs-title');
-                const snippetElement = element.querySelector('.gs-snippet');
-                if (titleElement && titleElement.href) {
-                    results.push({
-                        url: titleElement.href,
-                        title: titleElement.textContent,
-                        snippet: snippetElement ? snippetElement.textContent : ''
-                    });
-                }
-            });
-            return results;
-            """
-            
-            search_results = self.driver.execute_script(js_script)
-            print(f"Found {len(search_results)} results")
-
-            # If results are less than MIN_SEARCH_RESULTS, retry without quotes
-            if len(search_results) < self.MIN_SEARCH_RESULTS:
-                print(f"Found fewer than {self.MIN_SEARCH_RESULTS} results, retrying without quotes")
-                search_query = f"{query} -site:youtube.com -site:youtu.be -site:washingtonpost.com"
-                url = f"https://cse.google.com/cse?cx={self.search_engine_id}&q={quote_plus(search_query)}"
-                print(f"Retrying with URL: {url}")
-                
-                self.driver.get(url)
+            while page_count < max_pages:
+                # Wait for results
                 WebDriverWait(self.driver, 10).until(
                     EC.presence_of_element_located((By.CLASS_NAME, "gsc-result"))
                 )
                 time.sleep(3)
-                search_results = self.driver.execute_script(js_script)
-                print(f"Found {len(search_results)} results after retrying without quotes")
 
-            if len(search_results) > 0:
-                self.has_successful_search = True  # Mark that we've had a successful search
-                results = []
-                deferred_results = []
-                processed_urls = set()
+                # Extract results from current page
+                js_script = """
+                const results = [];
+                const elements = document.querySelectorAll('.gsc-result');
+                elements.forEach(element => {
+                    const titleElement = element.querySelector('a.gs-title');
+                    const snippetElement = element.querySelector('.gs-snippet');
+                    if (titleElement && titleElement.href) {
+                        results.push({
+                            url: titleElement.href,
+                            title: titleElement.textContent,
+                            snippet: snippetElement ? snippetElement.textContent : ''
+                        });
+                    }
+                });
+                return results;
+                """
                 
-                for result in search_results:
+                page_results = self.driver.execute_script(js_script)
+                print(f"Found {len(page_results)} results on page {page_count + 1}")
+
+                # Filter out duplicates and invalid URLs
+                page_results = [
+                    result for result in page_results
+                    if result['url'] not in processed_urls
+                    and result['url'].startswith('http')
+                    and not any(domain in result['url'].lower() for domain in [
+                        'youtube.com', 'youtu.be', 'vimeo.com',
+                        'dailymotion.com', 'tiktok.com'
+                    ])
+                ]
+
+                # Evaluate results relevance
+                highly_relevant, maybe_relevant = self._evaluate_search_results(page_results, query)
+                
+                # Process highly relevant results first
+                for result in highly_relevant:
+                    if len(all_results) >= target_results:
+                        break
+                        
                     try:
                         url = result['url']
-                        if not url or not url.startswith('http'):
-                            continue
-                            
-                        if url in processed_urls:
-                            continue
-                            
                         processed_urls.add(url)
                         
-                        if any(domain in url.lower() for domain in [
-                            'youtube.com', 
-                            'youtu.be',
-                            'vimeo.com',
-                            'dailymotion.com',
-                            'tiktok.com'
-                        ]):
-                            continue
-                        
-                        title = result['title']
-                        snippet = result['snippet']
-                        
-                        print(f"Processing URL: {url}")                    
-                        full_content, pub_date, confidence, image_reading_needed = self._extract_content(url, title, snippet, query=query)
-
-                        if image_reading_needed:
-                            # Defer processing this result
-                            deferred_results.append(result)
-                            continue
+                        print(f"Processing highly relevant URL: {url}")
+                        full_content, pub_date, confidence, image_reading_needed = self._extract_content(
+                            url, result['title'], result['snippet'], query
+                        )
 
                         if full_content and len(full_content.split()) > 50:
-                            print(f"Adding result for: {url}")
-                            results.append({
+                            all_results.append({
                                 'url': url,
-                                'title': title,
-                                'snippet': snippet,
+                                'title': result['title'],
+                                'snippet': result['snippet'],
                                 'content': full_content,
                                 'date': pub_date,
                                 'date_confidence': confidence
                             })
-                            print(f"Current results count: {len(results)}")
-                            
+                            print(f"Added highly relevant result: {url}")
                     except Exception as e:
                         print(f"Error processing result: {e}")
                         continue
 
-                print(f"Processed {len(results)} results without image reading")
-                print(f"Deferred {len(deferred_results)} results that require image reading")
+                # Check if we have minimum required results before proceeding
+                if len(all_results) < self.MIN_RESULTS:
+                    # Process maybe relevant results if needed
+                    for result in maybe_relevant:
+                        if len(all_results) >= target_results:
+                            break
+                        try:
+                            url = result['url']
+                            processed_urls.add(url)
+                            
+                            print(f"Processing maybe relevant URL: {url}")
+                            full_content, pub_date, confidence, image_reading_needed = self._extract_content(
+                                url, result['title'], result['snippet'], query
+                            )
 
-                # Decide whether to process deferred results
-                should_process_deferred = self._decide_to_process_deferred(query, time_range)
+                            if full_content and len(full_content.split()) > 50:
+                                all_results.append({
+                                    'url': url,
+                                    'title': result['title'],
+                                    'snippet': result['snippet'],
+                                    'content': full_content,
+                                    'date': pub_date,
+                                    'date_confidence': confidence
+                                })
+                                print(f"Added maybe relevant result: {url}")
+                        except Exception as e:
+                            print(f"Error processing result: {e}")
+                            continue
 
-                if should_process_deferred:
-                    print("Proceeding to process deferred results with image reading.")
-                    for result in deferred_results:
-                        self._process_deferred_result(result, query)
-                else:
-                    print("Skipping processing of deferred results as sufficient information is available.")
+                # Check if we need more results
+                if len(all_results) >= self.MIN_RESULTS and (
+                    len(all_results) >= target_results or 
+                    not self._should_load_more_results(all_results, query)
+                ):
+                    break
 
-                print(f"Returning {len(results)} results")
-                return results
+                # Try to go to next page
+                if not self._click_next_page():
+                    break
+                    
+                page_count += 1
+
+            if len(all_results) > 0:
+                self.has_successful_search = True
+                return all_results
             else:
                 if not self.has_successful_search:
-                    print("Google search detected robot - no previous successful searches, exiting immediately")
-                    os._exit(1)  # Force immediate exit
-                else:
-                    print("Google search detected robot but has previous successful searches - returning empty results")
-                    return []
+                    print("No results found and no previous successful searches - exiting")
+                    os._exit(1)
+                return []
 
         except Exception as e:
             print(f"Search error: {e}")
             if not self.has_successful_search:
-                print("Error during search with no previous successful searches - exiting immediately")
-                os._exit(1)  # Force immediate exit
+                print("Error during search with no previous successful searches - exiting")
+                os._exit(1)
             return []
 
     def _decide_to_process_deferred(self, query: str, time_range: str) -> bool:
@@ -912,29 +921,126 @@ class ResearchTool(Tool):
             print(f"Error extracting date with GPT: {str(e)}")
             print(f"Full response: {response.content if 'response' in locals() else 'No response'}")
             return None, 'low'
-    def _research_func(self, query: str) -> str:
+
+    def _evaluate_search_results(self, search_results: List[Dict], query: str) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Evaluate search results to determine which ones are most likely to be relevant.
+        Returns tuple of (likely_relevant, maybe_relevant) results.
+        """
+        if not search_results:
+            return [], []
+
+        # Prepare the evaluation prompt
+        results_text = "\n\n".join([
+            f"Result {i+1}:\n"
+            f"Title: {result['title']}\n"
+            f"URL: {result['url']}\n"
+            f"Snippet: {result['snippet']}"
+            for i, result in enumerate(search_results)
+        ])
+
+        prompt = (
+            f"Given this search query: '{query}'\n\n"
+            f"Evaluate these search results and classify them into two categories:\n"
+            f"1. Highly relevant (likely to contain valuable information)\n"
+            f"2. Maybe relevant (might contain useful information)\n\n"
+            f"Consider:\n"
+            f"- How closely the title and snippet match the query intent\n"
+            f"- The credibility of the source\n"
+            f"- The likely freshness of the information\n"
+            f"- Whether the content appears to be substantive\n\n"
+            f"Search Results:\n{results_text}\n\n"
+            f"Respond in JSON format:\n"
+            "{\n"
+            '    "highly_relevant": [result_numbers],\n'
+            '    "maybe_relevant": [result_numbers],\n'
+            '    "reasoning": "brief explanation of key decisions"\n'
+            "}"
+        )
+
         try:
-            print("Starting research function with query:", query)
-            # Reset global counters and accumulators at the start of each search
-            self.total_image_interpretations = 0
-            self.accumulated_extracted_texts = []
-            refined_query, required_terms, excluded_terms, time_range = self._refine_query(query)
-            print("After refine_query")
+            response = openai_llm_mini.invoke([HumanMessage(content=prompt)])
+            result = json.loads(clean_response(response.content))
             
-            results = self._google_search(refined_query, required_terms, excluded_terms, time_range)
-            print(f"After google_search, got {len(results)} results")
+            highly_relevant = [search_results[i-1] for i in result['highly_relevant']]
+            maybe_relevant = [search_results[i-1] for i in result['maybe_relevant']]
             
-           
-            try:  # Add try-except here
-
-                structured_data = self._post_process(results, query)
-                return structured_data
-            except Exception as e:
-                print(f"Error in post-processing: {e}")
-                return json.dumps(results, indent=True)  # Return raw results if post-processing fails
-
+            print(f"Evaluation complete: {len(highly_relevant)} highly relevant, {len(maybe_relevant)} maybe relevant")
+            print(f"Reasoning: {result['reasoning']}")
+            
+            return highly_relevant, maybe_relevant
         except Exception as e:
-            print(f"Error in research function: {e}")
-            print(f"Full error details: {traceback.format_exc()}")  # Add this for more detail
-            return f"Error performing research: {str(e)}"
+            print(f"Error evaluating search results: {e}")
+            return search_results, []  # Return all results as highly relevant if evaluation fails
+
+    def _should_load_more_results(self, current_results: List[Dict], query: str) -> bool:
+        """
+        Determine if more search results should be loaded based on current findings.
+        """
+        # Don't load more if we've hit MAX_RESULTS
+        if len(current_results) >= self.MAX_RESULTS:
+            return False
+        
+        # Always load more if we haven't hit MIN_RESULTS
+        if len(current_results) < self.MIN_RESULTS:
+            return True
+
+        # Prepare summary of current results
+        results_summary = "\n".join([
+            f"- {result.get('title', 'Untitled')} ({result.get('date', 'Unknown date')})"
+            for result in current_results
+        ])
+
+        prompt = (
+            f"Given this search query: '{query}'\n\n"
+            f"Current results collected:\n{results_summary}\n\n"
+            f"Should we load more search results? Consider:\n"
+            f"1. Do we have enough diverse sources?\n"
+            f"2. Do we have recent enough information?\n"
+            f"3. Are there likely gaps in the current information?\n"
+            f"4. Would more results help answer the query more comprehensively?\n\n"
+            f"Respond with ONLY 'yes' or 'no' followed by a brief reason."
+        )
+
+        try:
+            response = openai_llm_mini.invoke([HumanMessage(content=prompt)])
+            decision = response.content.lower().strip()
+            
+            print(f"Load more decision: {decision}")
+            return decision.startswith('yes')
+        except Exception as e:
+            print(f"Error in load more decision: {e}")
+            return len(current_results) < 5  # Default to yes if less than 5 results
+
+    def _click_next_page(self) -> bool:
+        """
+        Attempt to click the 'Next' button for search results.
+        Returns True if successful, False otherwise.
+        """
+        try:
+            # Try multiple possible selectors for the next button
+            next_button_selectors = [
+                ".gsc-cursor-next-page",
+                "button.gsc-next",
+                "a.gsc-next",
+                "[aria-label='Next page']",
+                "[title='Next']"
+            ]
+            
+            for selector in next_button_selectors:
+                try:
+                    next_button = WebDriverWait(self.driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                    next_button.click()
+                    time.sleep(2)  # Wait for new results to load
+                    return True
+                except:
+                    continue
+                
+            print("No next page button found")
+            return False
+        except Exception as e:
+            print(f"Error clicking next page: {e}")
+            return False
         

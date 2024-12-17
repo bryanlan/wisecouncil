@@ -2,7 +2,8 @@
 
 import re
 import json
-from langgraph.graph import END
+from langgraph.graph import Graph, END
+ 
 
 def clean_response(content: str) -> str:
     """
@@ -12,6 +13,8 @@ def clean_response(content: str) -> str:
     - Fixing invalid escape sequences
     - Ensuring the string can be parsed as valid JSON
     """
+    if content is None or content == '':
+        return ''
     # Remove code fences and JSON labels
     content = content.strip()
     if content.startswith('```'):
@@ -40,6 +43,9 @@ def clean_response(content: str) -> str:
             return escape[1:]  # Remove the backslash
 
     content = re.sub(r'\\.', fix_invalid_escapes, content)
+
+    # Remove trailing commas before closing braces or brackets
+    content = re.sub(r',(\s*[}\]])', r'\1', content)
 
     # Now, try to load the JSON to check if it's valid
     try:

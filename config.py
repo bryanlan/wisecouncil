@@ -17,8 +17,8 @@ TOOLPREFIX = "Tool Provided Data:"
 debugme = 1  # Set to 0 to disable debugging window
 moderatorPromptEnd = (f"Respond in the following JSON format:\n"
     "{\n"
-    '   "next_agent": "the name of the next agent to speak",\n'
-    '   "agent_instruction": "Name of the next agent followed by instructions to the agent",\n'
+    '   "next_agent": "the name of the next agent to speak, only ONE agent",\n'
+    '   "agent_instruction": "Name of the next agent followed by instructions to the agent, or END if the conversation has reached a conclusion",\n'
     '   "final_thoughts": "Your final thoughts on the conversation.",\n'
     "}"
 )

@@ -17,30 +17,6 @@ class BaseAgent:
         self.llm = llm
         self.role = role
         self.available_tools = available_tools
-        self.system_message = self._construct_system_message()
-
-    def _construct_system_message(self) -> str:
-        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-        base_message = f"You are {self.name}, {self.role}\n\n"
-        base_message += f"Today's date is {current_date}.\n"
-        if self.available_tools:
-            base_message += "Available tools:\n"
-            for tool in self.available_tools:
-                base_message += f"- {tool.name}: {tool.description}\n"
-        base_message += "\nYou must respond with ONLY a valid JSON object using the following strict formatting rules:\n"
-        base_message += "1. Use double quotes (not single quotes) for all JSON keys and string values\n"
-        base_message += "2. For newlines in strings, use the escaped sequence '\\n' (not actual line breaks)\n"
-        base_message += "3. The JSON object must contain these exact keys:\n"
-        base_message += "   - 'thought': your reasoning process as a single-line string\n"
-        base_message += "   - 'response': your response as a single-line string (use '\\n' for paragraph breaks)\n"
-        base_message += "   - 'tool_calls': (optional) array of objects with 'tool_name' and 'tool_input' strings\n"
-        base_message += "   - 'next_agent': the name of the next agent to speak, or 'END' if the conversation is complete\n"
-        base_message += "4. Do not include any markdown formatting or code blocks\n"
-        base_message += "5. Do not wrap the JSON in quotes or backticks\n"
-        base_message += "Example format:\n"
-        base_message += '{"thought":"reasoning here","response":"first paragraph\\n\\nsecond paragraph","tool_calls":[]}\n'
-        base_message += "Ensure your response is exactly one JSON object that can be parsed by JSON.parse()\n"
-        return base_message
 
     def _invoke_tools(self, tool_calls: List[Dict], state: AgentState) -> List[Dict]:
         tool_results = []
@@ -110,78 +86,131 @@ class BaseAgent:
             return {"error": f"Error: {str(e)}"}, []
 
 class FeedbackAgent(BaseAgent):
-    def __init__(self, name: str, llm, role: str, topology: str, agent_names: List[str], available_tools: List[Tool]):
+    def __init__(self, name: str, llm, role: str, topology: str, agent_info: List[Dict[str, str]], available_tools: List[Tool]):
         super().__init__(name, llm, role, available_tools)
         self.topology = topology
-        self.agent_names = agent_names
+        self.agent_info = agent_info  # Full agent information including roles
+        self.agent_names = [agent['name'] for agent in agent_info]  # Just the names
+        self.system_message = self._construct_simple_system_message()
         
+    def _construct_simple_system_message(self) -> str:
+        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        base_message = f"You are {self.name}, {self.role}\n\n"
+        base_message += f"Today's date is {current_date}.\n"
+        return base_message
 
-    def _process_response(self, response_text: str, state: AgentState, retry_count: int = 0) -> Tuple[Dict, List[Dict]]:
-        MAX_RETRIES = 3
-        response_data, tool_results = super()._process_response(response_text, state, retry_count)
-        if 'error' in response_data:
-            return response_data, tool_results
-        if 'response' not in response_data:
-            if retry_count < MAX_RETRIES:
-                return self._process_response(response_text, state, retry_count + 1)
+    def _should_use_tools(self, conversation_messages) -> List[Dict]:
+        """Use mini LLM to determine if and which tools to use"""
+        # Include tool information in the mini LLM prompt
+        tools_info = "Available tools:\n" + "\n".join(
+            [f"- {tool.name}: {tool.description}" for tool in self.available_tools]
+        )
+        
+        tool_decision_prompt = (
+            f"{tools_info}\n\n"
+            "Your task is to analyze the conversation and ONLY determine if any tools need to be used to answer the question. "
+            "DO NOT continue the conversation or provide additional commentary."
+        )
+        
+        reminder = (
+            "\n\nYou must respond with ONLY a JSON object that specifies:\n"
+            "1. Whether any tools need to be used to answer the question ('use_tools': true/false)\n"
+            "2. If tools should be used, specify which ones in 'tool_calls'\n\n"
+            "Required JSON format:\n"
+            '{"use_tools": boolean, "tool_calls": [{"tool_name": "string", "tool_input": "string"}]}\n\n'
+            "Example responses:\n"
+            '{"use_tools": false, "tool_calls": []}\n'
+            '{"use_tools": true, "tool_calls": [{"tool_name": "calculator", "tool_input": "2+2"}]}'
+        )
+        
+        # Create a copy of the conversation messages to avoid modifying the original
+        messages = conversation_messages.copy()
+        
+        # Add reminder to the last message if there are any messages
+        if messages:
+            if isinstance(messages[-1], HumanMessage):
+                messages[-1] = HumanMessage(content=messages[-1].content + reminder)
             else:
-                return {"error": f"Error: No 'response' key found after {MAX_RETRIES} attempts"}, tool_results
-        return response_data, tool_results
+                messages.append(HumanMessage(content=reminder))
+        
+        messages = [
+            SystemMessage(content=tool_decision_prompt),
+            *messages
+        ]
+        
+        response = openai_llm_mini.invoke(messages)
+        try:
+            decision = json.loads(clean_response(response.content))
+            return decision.get('tool_calls', []) if decision.get('use_tools', False) else []
+        except json.JSONDecodeError:
+            print(f"Warning: Invalid JSON response from tool decision: {response.content}")
+            return []
+
+    def _determine_next_agent(self, conversation_messages) -> str:
+        """Use mini LLM to determine the next agent"""
+        # Create a description of each agent with their role
+        agent_descriptions = "\n".join([
+            f"- {agent['name']}: {agent['role']}" 
+            for agent in self.agent_info
+        ])
+        
+        next_agent_prompt = (
+            f"Based on the conversation and the following agents' roles:\n\n"
+            f"{agent_descriptions}\n\n"
+            f"Who should speak next? Consider each agent's role and expertise. "
+            f"Options are: {', '.join(self.agent_names)} or 'END'. "
+            f"Respond with just the name or 'END' if the conversation is complete."
+        )
+        
+        messages = [
+            SystemMessage(content=next_agent_prompt),
+            *conversation_messages
+        ]
+        
+        response = openai_llm_mini.invoke(messages)
+        next_agent = clean_response(response.content).strip()
+        return next_agent if next_agent in self.agent_names or next_agent == 'END' else 'END'
 
     def generate_response(self, state: AgentState) -> AgentState:
-        messages = [SystemMessage(content=self.system_message)] + state['conversation_messages']
-        response = self.llm.invoke(messages)
-
-        max_retries = 3
-        attempt = 0
-
-        response_data = None
-        tool_results = None
-        while attempt < max_retries:
-            try:
-                # Process response and handle any tool calls
-                response_data, tool_results = self._process_response(response.content, state)
-                break  # Exit the loop if successful
-            except Exception as e:
-                attempt += 1
-                print(f"Attempt {attempt} failed in _process_response: {e}")
-                
-                if attempt < max_retries:
-                    print("Retrying...")
-                    response = self.llm.invoke(messages)  # Reinvoke the LLM
-                else:
-                    print("Max retries reached. Raising the exception.")
-                    raise  # Re-raise the exception if max retries are exceeded
-
-
-        if 'error' in response_data:
-            # Handle error
-            state['conversation_messages'].append(
-                AIMessage(content=f"{self.name}: {response_data['error']}")
-            )
-            state['nextAgent'] = 'END'
-            return state
-
-        # Add tool results to conversation
-        if tool_results:
-            for tool_result in tool_results:
-                tool_message = f"{TOOLPREFIX}{tool_result['tool_result']}"
+        # Step 1: Determine if tools should be used
+        tool_calls = self._should_use_tools(state['conversation_messages'])
+        
+        # Step 2: Execute tools if needed and collect results
+        tool_results = []
+        if tool_calls:
+            tool_results = self._invoke_tools(tool_calls, state)
+            # Add tool results to conversation context
+            for result in tool_results:
+                tool_message = f"{TOOLPREFIX}{result['tool_result']}"
                 state['conversation_messages'].append(AIMessage(content=tool_message))
-
-        # Add final response to conversation
-        response_message = f"{self.name}: {response_data['response']}"
-        state['conversation_messages'].append(HumanMessage(content=response_message))
-
-        # Handle next agent selection based on topology
+        
+        # Step 3: Generate main response using primary LLM
+        messages = [
+            SystemMessage(content=self.system_message),
+            *state['conversation_messages']
+        ]
+        response = self.llm.invoke(messages)
+        
+        # Step 4: Add response to conversation
+        response_message = f"{self.name}: {response.content}"
+        state['conversation_messages'].append(AIMessage(content=response_message))
+        
+        # Step 5: Determine next agent
         if self.topology == 'last_decides_next':
-            next_agent = response_data.get('next_agent')
-            if next_agent and next_agent in [agent for agent in self.agent_names]:
-                state['next_agent'] = next_agent
-            else:
-                state['nextAgent'] = 'END'
+            next_agent = self._determine_next_agent(state['conversation_messages'])
+            state['nextAgent'] = next_agent
         elif 'moderator' in self.topology.lower() or 'moderated' in self.topology.lower():
             state['nextAgent'] = "Moderator"
-
+        
+        # Add debugging info
+        if 'debugging_info' not in state:
+            state['debugging_info'] = []
+        state['debugging_info'].append({
+            'agent_name': self.name,
+            'messages_sent': messages,
+            'response': f"Final response: {response.content}"
+        })
+        
         return state
 
 class ModeratorAgent(BaseAgent):
@@ -248,7 +277,12 @@ class ModeratorAgent(BaseAgent):
                 tool_message = f"{TOOLPREFIX}{tool_result['tool_result']}"
                 state['conversation_messages'].append(AIMessage(content=tool_message))
 
-        if state['nextAgent'].upper() == 'END' and response_data.get('final_thoughts'):
+        # Validate next_agent
+        next_agent = response_data.get('next_agent', 'END')
+        if next_agent not in self.agent_names and next_agent != 'END':
+            next_agent = 'END'
+
+        if next_agent == 'END' and response_data.get('final_thoughts'):
             state['conversation_messages'].append(
                 AIMessage(content=f"{self.name}: {response_data['final_thoughts']}")
             )
@@ -257,7 +291,7 @@ class ModeratorAgent(BaseAgent):
             state['conversation_messages'].append(
                 HumanMessage(content=f"{self.name}: {response_data['agent_instruction']}")
             )
-            state['nextAgent'] = response_data.get('next_agent', 'END')
+            state['nextAgent'] = next_agent
 
         return state
 
@@ -290,7 +324,7 @@ class SetupAgent:
             f"     * 'name': The agent's friendly name\n"
             f"     * 'type': The LLM to use (from the available agents)\n"
             f"     * 'role': The system prompt for the agent that describes who the agent is\n"
-            f"3. If the topology type includes a moderator, include 'moderator_prompt': A proposed system prompt for the moderator, which includes how the moderator should focus the discussion, the names and roles (not model type) of the agents, the goal for feedback agent participation order.\n\n"
+            f"3. If the topology type includes a moderator, include 'moderator_prompt': A proposed system prompt for the moderator, which includes how the moderator should focus the discussion, the names and roles (not model type) of the agents. Be sure to use the word agent in describing the agents and be very precise in repeating any relevant setup information.\n\n"
             f"Please return the JSON without any additional text or formatting."
 )
 

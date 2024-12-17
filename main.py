@@ -11,6 +11,7 @@ from llms import openai_llm
 from agents import SetupAgent, FeedbackAgent, ModeratorAgent
 from tools import ResearchTool
 from state import AgentState
+import time
 
 # Initialize the SetupAgent
 setup_agent = SetupAgent(openai_llm)
@@ -112,8 +113,8 @@ def run_conversation(
                 llm=llm,
                 role=role,
                 topology=topology_type,
-                agent_names=agents_list,
-                available_tools= available_tools
+                agent_info=agents_list,
+                available_tools=available_tools
             )
     
     # Error if no moderator found when expected
@@ -192,6 +193,7 @@ def run_conversation(
     }
 
     output_conversation = ""
+    output_debugging = ""
   
     config = {"recursion_limit": 50}
     for i, s in enumerate(chain.stream(state, config=config )):
@@ -203,10 +205,9 @@ def run_conversation(
         # Collect messages
         current_agent = list(s.keys())[0]
         agent_state = s[current_agent]
-        # Use conversation_messages to build the output
         messages = agent_state.get('conversation_messages', [])
         output_conversation = format_messages(messages, suppressResearch)
-        output_debugging = ""
+        
         # Collect debugging info
         if debugme == 1 and 'debugging_info' in agent_state:
             for debug_entry in agent_state['debugging_info']:
@@ -216,6 +217,14 @@ def run_conversation(
                 output_debugging += f"\n\nAgent: {agent_name}\nMessages Sent:\n"
                 output_debugging += format_messages(messages_sent, False)
                 output_debugging += f"\n\nResponse:\n{response}"
+                
+                # Overwrite debug.txt each time
+                with open('debug.txt', 'w', encoding='utf-8') as f:
+                    f.write(f"=== Debug Output {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                    f.write(f"Agent: {agent_name}\nMessages Sent:\n")
+                    f.write(format_messages(messages_sent, False))
+                    f.write(f"\n\nResponse:\n{response}\n")
+                    f.write("\n" + "="*50 + "\n")
 
     if prepare_report:
         # Construct the conversation transcript
@@ -237,7 +246,41 @@ def run_conversation(
     return output_conversation, output_debugging, report
 
 # Gradio Interface
-with gr.Blocks() as demo:
+with gr.Blocks(css="""
+    .debugging-output > label > textarea {
+        overflow-y: auto !important;
+        max-height: 500px !important;
+        height: 500px !important;
+    }
+    
+    .pretty_scrollbar::-webkit-scrollbar {
+        width: 10px;
+    }
+    
+    .pretty_scrollbar::-webkit-scrollbar-track {
+        background: transparent;
+    }
+    
+    .pretty_scrollbar::-webkit-scrollbar-thumb,
+    .pretty_scrollbar::-webkit-scrollbar-thumb:hover {
+        background: #c5c5d2;
+        border-radius: 10px;
+    }
+    
+    .dark .pretty_scrollbar::-webkit-scrollbar-thumb,
+    .dark .pretty_scrollbar::-webkit-scrollbar-thumb:hover {
+        background: #374151;
+        border-radius: 10px;
+    }
+    
+    .pretty_scrollbar::-webkit-resizer {
+        background: #c5c5d2;
+    }
+    
+    .dark .pretty_scrollbar::-webkit-resizer {
+        background: #374151;
+    }
+""") as demo:
     gr.Markdown("## Wise Council")
     reporterPrompt = '''Using the following conversation and tool outputs, create a research report designed to answer the question: [council question].\n The report should be very detailed and scientific, presenting uncertainty in a probabilistic fashion, and if necessary, contain subjects for further research or next steps, as appropriate.'''
     with gr.Row():
@@ -284,7 +327,14 @@ with gr.Blocks() as demo:
         run_button = gr.Button("Begin Conversation")
 
     conversation_output = gr.Textbox(label="Conversation Output", lines=20)
-    debugging_output = gr.Textbox(label="Debugging Output", lines=20, visible=debugme)
+
+
+    debugging_output = gr.Textbox(
+        label="Debugging Output", 
+        lines=20, 
+        visible=debugme, 
+        elem_classes=["debugging-output", "pretty_scrollbar"]
+    )
     report_output = gr.Textbox(label="Report", lines=20)  # New output component
 
     # Function to populate the setup fields after generating setup
