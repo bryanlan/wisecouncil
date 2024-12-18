@@ -96,7 +96,14 @@ class FeedbackAgent(BaseAgent):
     def _construct_simple_system_message(self) -> str:
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
         base_message = f"You are {self.name}, {self.role}\n\n"
-        base_message += f"Today's date is {current_date}.\n"
+        base_message += f"Today's date is {current_date}.\n\n"
+        
+        # Add information about other agents
+        base_message += "Other agents in this discussion:\n"
+        for agent in self.agent_info:
+            if agent['name'] != self.name:  # Skip the current agent
+                base_message += f"- {agent['name']}: {agent['role']}\n"
+        
         return base_message
 
     def _should_use_tools(self, conversation_messages) -> List[Dict]:
@@ -159,7 +166,8 @@ class FeedbackAgent(BaseAgent):
             f"{agent_descriptions}\n\n"
             f"Who should speak next? Consider each agent's role and expertise. "
             f"Options are: {', '.join(self.agent_names)} or 'END'. "
-            f"Respond with just the name or 'END' if the conversation is complete."
+            f"Respond with just the name or 'END' if the conversation goals have been met or the conversation is repetitive. "
+            f"Reminder: ONLY return the name of the next agent or 'END', nothing else."
         )
         
         messages = [
@@ -168,7 +176,7 @@ class FeedbackAgent(BaseAgent):
         ]
         
         response = openai_llm_mini.invoke(messages)
-        next_agent = clean_response(response.content).strip()
+        next_agent = response.content.strip()
         return next_agent if next_agent in self.agent_names or next_agent == 'END' else 'END'
 
     def generate_response(self, state: AgentState) -> AgentState:
@@ -196,11 +204,13 @@ class FeedbackAgent(BaseAgent):
         state['conversation_messages'].append(AIMessage(content=response_message))
         
         # Step 5: Determine next agent
+        next_agent = None
         if self.topology == 'last_decides_next':
             next_agent = self._determine_next_agent(state['conversation_messages'])
             state['nextAgent'] = next_agent
         elif 'moderator' in self.topology.lower() or 'moderated' in self.topology.lower():
-            state['nextAgent'] = "Moderator"
+            next_agent = "Moderator"
+            state['nextAgent'] = next_agent
         
         # Add debugging info
         if 'debugging_info' not in state:
@@ -208,7 +218,8 @@ class FeedbackAgent(BaseAgent):
         state['debugging_info'].append({
             'agent_name': self.name,
             'messages_sent': messages,
-            'response': f"Final response: {response.content}"
+            'response': f"Final response: {response.content}",
+            'next_agent': next_agent
         })
         
         return state

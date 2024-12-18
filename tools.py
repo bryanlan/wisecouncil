@@ -460,8 +460,8 @@ class ResearchTool(Tool):
         target_results = num_results if num_results is not None else self.MAX_RESULTS
         
         try:
-            # Build initial search query with quotes
-            search_query = f'"{query}" -site:youtube.com -site:youtu.be -site:washingtonpost.com'
+            # Build initial search query without quotes
+            search_query = f'{query} -site:youtube.com -site:youtu.be -site:washingtonpost.com'
             url = f"https://cse.google.com/cse?cx={self.search_engine_id}&q={quote_plus(search_query)}"
             
             self.driver.get(url)
@@ -494,6 +494,11 @@ class ResearchTool(Tool):
                 page_results = self.driver.execute_script(js_script)
                 print(f"Found {len(page_results)} results on page {page_count + 1}")
 
+                # If no results found, check for previous successful search
+                if not page_results:
+                    print(f"No results found for URL: {url}")
+                    return []
+
                 # Filter out duplicates and invalid URLs
                 page_results = [
                     result for result in page_results
@@ -505,48 +510,21 @@ class ResearchTool(Tool):
                     ])
                 ]
 
-                # Evaluate results relevance
-                highly_relevant, maybe_relevant = self._evaluate_search_results(page_results, query)
-                
-                # Process highly relevant results first
-                for result in highly_relevant:
-                    if len(all_results) >= target_results:
-                        break
-                        
-                    try:
-                        url = result['url']
-                        processed_urls.add(url)
-                        
-                        print(f"Processing highly relevant URL: {url}")
-                        full_content, pub_date, confidence, image_reading_needed = self._extract_content(
-                            url, result['title'], result['snippet'], query
-                        )
-
-                        if full_content and len(full_content.split()) > 50:
-                            all_results.append({
-                                'url': url,
-                                'title': result['title'],
-                                'snippet': result['snippet'],
-                                'content': full_content,
-                                'date': pub_date,
-                                'date_confidence': confidence
-                            })
-                            print(f"Added highly relevant result: {url}")
-                    except Exception as e:
-                        print(f"Error processing result: {e}")
-                        continue
-
-                # Check if we have minimum required results before proceeding
-                if len(all_results) < self.MIN_RESULTS:
-                    # Process maybe relevant results if needed
-                    for result in maybe_relevant:
+                # Only evaluate relevance if we have results
+                if page_results:
+                    # Evaluate results relevance
+                    highly_relevant, maybe_relevant = self._evaluate_search_results(page_results, query)
+                    
+                    # Process highly relevant results first
+                    for result in highly_relevant:
                         if len(all_results) >= target_results:
                             break
+                            
                         try:
                             url = result['url']
                             processed_urls.add(url)
                             
-                            print(f"Processing maybe relevant URL: {url}")
+                            print(f"Processing highly relevant URL: {url}")
                             full_content, pub_date, confidence, image_reading_needed = self._extract_content(
                                 url, result['title'], result['snippet'], query
                             )
@@ -560,10 +538,39 @@ class ResearchTool(Tool):
                                     'date': pub_date,
                                     'date_confidence': confidence
                                 })
-                                print(f"Added maybe relevant result: {url}")
+                                print(f"Added highly relevant result: {url}")
                         except Exception as e:
                             print(f"Error processing result: {e}")
                             continue
+
+                    # Check if we have minimum required results before proceeding
+                    if len(all_results) < self.MIN_RESULTS:
+                        # Process maybe relevant results if needed
+                        for result in maybe_relevant:
+                            if len(all_results) >= target_results:
+                                break
+                            try:
+                                url = result['url']
+                                processed_urls.add(url)
+                                
+                                print(f"Processing maybe relevant URL: {url}")
+                                full_content, pub_date, confidence, image_reading_needed = self._extract_content(
+                                    url, result['title'], result['snippet'], query
+                                )
+
+                                if full_content and len(full_content.split()) > 50:
+                                    all_results.append({
+                                        'url': url,
+                                        'title': result['title'],
+                                        'snippet': result['snippet'],
+                                        'content': full_content,
+                                        'date': pub_date,
+                                        'date_confidence': confidence
+                                    })
+                                    print(f"Added maybe relevant result: {url}")
+                            except Exception as e:
+                                print(f"Error processing result: {e}")
+                                continue
 
                 # Check if we need more results
                 if len(all_results) >= self.MIN_RESULTS and (
@@ -580,18 +587,10 @@ class ResearchTool(Tool):
 
             if len(all_results) > 0:
                 self.has_successful_search = True
-                return all_results
-            else:
-                if not self.has_successful_search:
-                    print("No results found and no previous successful searches - exiting")
-                    os._exit(1)
-                return []
+            return all_results
 
         except Exception as e:
             print(f"Search error: {e}")
-            if not self.has_successful_search:
-                print("Error during search with no previous successful searches - exiting")
-                os._exit(1)
             return []
 
     def _decide_to_process_deferred(self, query: str, time_range: str) -> bool:
@@ -667,6 +666,9 @@ class ResearchTool(Tool):
             results = self._google_search(refined_query, required_terms, excluded_terms, time_range)
             print(f"After google_search, got {len(results)} results")
             
+            # Add check for empty results
+            if not results:
+                return "No relevant information found for the given query."
             
             structured_data = self._post_process(results, query)
             return structured_data
@@ -748,13 +750,13 @@ class ResearchTool(Tool):
             f"Convert this date string to a standardized format.\n"
             f"Current date: {current_date.strftime('%Y-%m-%d')}\n"
             f"Input date: {date_str}\n\n"
-            f"Return the result in this JSON format:\n"
+            f"Return ONLY the result in this JSON format:\n"
             "{\n"
             '    "standardized_date": "YYYY-MM-DD",\n'  # Use null if can't determine
             '    "confidence": "high/medium/low"\n'
             "}\n\n"
             f"Handle relative dates (e.g., '2 days ago', 'last week') using the current date.\n"
-            f"If you cannot determine a specific date, return null for standardized_date."
+            f"If you cannot determine a specific date, return null for standardized_date. Reminder ONLY return the JSON object, nothing else."
         )
         
         try:
@@ -998,7 +1000,7 @@ class ResearchTool(Tool):
             f"1. Do we have enough diverse sources?\n"
             f"2. Do we have recent enough information?\n"
             f"3. Are there likely gaps in the current information?\n"
-            f"4. Would more results help answer the query more comprehensively?\n\n"
+            f"4. Would more results significantly improve the answer to the query?\n\n"
             f"Respond with ONLY 'yes' or 'no' followed by a brief reason."
         )
 

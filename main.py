@@ -194,7 +194,13 @@ def run_conversation(
 
     output_conversation = ""
     output_debugging = ""
-  
+    debug_iteration = 0  # Add iteration counter
+    
+    # Clear debug.txt at the start of a new conversation
+    if debugme == 1:
+        with open('debug.txt', 'w', encoding='utf-8') as f:
+            f.write(f"=== New Debug Session {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+
     config = {"recursion_limit": 50}
     for i, s in enumerate(chain.stream(state, config=config )):
         if i >= max_iterations:
@@ -210,20 +216,24 @@ def run_conversation(
         
         # Collect debugging info
         if debugme == 1 and 'debugging_info' in agent_state:
+            debug_iteration += 1  # Increment iteration counter
             for debug_entry in agent_state['debugging_info']:
                 agent_name = debug_entry['agent_name']
                 messages_sent = debug_entry['messages_sent']
                 response = debug_entry['response']
+                next_agent = debug_entry.get('next_agent', 'Not specified')
                 output_debugging += f"\n\nAgent: {agent_name}\nMessages Sent:\n"
                 output_debugging += format_messages(messages_sent, False)
                 output_debugging += f"\n\nResponse:\n{response}"
+                output_debugging += f"\nNext Agent: {next_agent}"
                 
-                # Overwrite debug.txt each time
-                with open('debug.txt', 'w', encoding='utf-8') as f:
-                    f.write(f"=== Debug Output {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                # Append to debug.txt with iteration number
+                with open('debug.txt', 'a', encoding='utf-8') as f:
+                    f.write(f"\n=== Debug log for iteration {debug_iteration} ===\n")
                     f.write(f"Agent: {agent_name}\nMessages Sent:\n")
                     f.write(format_messages(messages_sent, False))
-                    f.write(f"\n\nResponse:\n{response}\n")
+                    f.write(f"\n\nResponse:\n{response}")
+                    f.write(f"\nNext Agent: {next_agent}\n")
                     f.write("\n" + "="*50 + "\n")
 
     if prepare_report:
