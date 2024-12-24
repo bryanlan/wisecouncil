@@ -109,48 +109,51 @@ class FeedbackAgent(BaseAgent):
     def _should_use_tools(self, conversation_messages) -> List[Dict]:
         """Use mini LLM to determine if and which tools to use"""
         # Include tool information in the mini LLM prompt
-        tools_info = "Available tools:\n" + "\n".join(
-            [f"- {tool.name}: {tool.description}" for tool in self.available_tools]
-        )
+        if self.available_tools:
+            tools_info = "Available tools:\n" + "\n".join(
+                [f"- {tool.name}: {tool.description}" for tool in self.available_tools]
+            )
         
-        tool_decision_prompt = (
-            f"{tools_info}\n\n"
-            "Your task is to analyze the conversation and ONLY determine if any tools need to be used to answer the question. "
-            "DO NOT continue the conversation or provide additional commentary."
-        )
-        
-        reminder = (
-            "\n\nYou must respond with ONLY a JSON object that specifies:\n"
-            "1. Whether any tools need to be used to answer the question ('use_tools': true/false)\n"
-            "2. If tools should be used, specify which ones in 'tool_calls'\n\n"
-            "Required JSON format:\n"
-            '{"use_tools": boolean, "tool_calls": [{"tool_name": "string", "tool_input": "string"}]}\n\n'
-            "Example responses:\n"
-            '{"use_tools": false, "tool_calls": []}\n'
-            '{"use_tools": true, "tool_calls": [{"tool_name": "calculator", "tool_input": "2+2"}]}'
-        )
-        
-        # Create a copy of the conversation messages to avoid modifying the original
-        messages = conversation_messages.copy()
-        
-        # Add reminder to the last message if there are any messages
-        if messages:
-            if isinstance(messages[-1], HumanMessage):
-                messages[-1] = HumanMessage(content=messages[-1].content + reminder)
-            else:
-                messages.append(HumanMessage(content=reminder))
-        
-        messages = [
-            SystemMessage(content=tool_decision_prompt),
-            *messages
-        ]
-        
-        response = openai_llm_mini.invoke(messages)
-        try:
-            decision = json.loads(clean_response(response.content))
-            return decision.get('tool_calls', []) if decision.get('use_tools', False) else []
-        except json.JSONDecodeError:
-            print(f"Warning: Invalid JSON response from tool decision: {response.content}")
+            tool_decision_prompt = (
+                f"{tools_info}\n\n"
+                "Your task is to analyze the conversation and ONLY determine if any tools need to be used to answer the question. "
+                "DO NOT continue the conversation or provide additional commentary."
+            )
+            
+            reminder = (
+                "\n\nYou must respond with ONLY a JSON object that specifies:\n"
+                "1. Whether any tools need to be used to answer the question ('use_tools': true/false)\n"
+                "2. If tools should be used, specify which ones in 'tool_calls'\n\n"
+                "Required JSON format:\n"
+                '{"use_tools": boolean, "tool_calls": [{"tool_name": "string", "tool_input": "string"}]}\n\n'
+                "Example responses:\n"
+                '{"use_tools": false, "tool_calls": []}\n'
+                '{"use_tools": true, "tool_calls": [{"tool_name": "calculator", "tool_input": "2+2"}]}'
+            )
+            
+            # Create a copy of the conversation messages to avoid modifying the original
+            messages = conversation_messages.copy()
+            
+            # Add reminder to the last message if there are any messages
+            if messages:
+                if isinstance(messages[-1], HumanMessage):
+                    messages[-1] = HumanMessage(content=messages[-1].content + reminder)
+                else:
+                    messages.append(HumanMessage(content=reminder))
+            
+            messages = [
+                SystemMessage(content=tool_decision_prompt),
+                *messages
+            ]
+            
+            response = openai_llm_mini.invoke(messages)
+            try:
+                decision = json.loads(clean_response(response.content))
+                return decision.get('tool_calls', []) if decision.get('use_tools', False) else []
+            except json.JSONDecodeError:
+                print(f"Warning: Invalid JSON response from tool decision: {response.content}")
+                return []
+        else:
             return []
 
     def _determine_next_agent(self, conversation_messages) -> str:
@@ -203,14 +206,17 @@ class FeedbackAgent(BaseAgent):
         response_message = f"{self.name}: {response.content}"
         state['conversation_messages'].append(AIMessage(content=response_message))
         
-        # Step 5: Determine next agent
-        next_agent = None
+        # Step 5: Determine next agent based on topology
         if self.topology == 'last_decides_next':
             next_agent = self._determine_next_agent(state['conversation_messages'])
             state['nextAgent'] = next_agent
+        elif self.topology == 'round_robin':
+            # Find current agent's index and get next agent
+            current_idx = self.agent_names.index(self.name)
+            next_idx = (current_idx + 1) % len(self.agent_names)
+            state['nextAgent'] = self.agent_names[next_idx]
         elif 'moderator' in self.topology.lower() or 'moderated' in self.topology.lower():
-            next_agent = "Moderator"
-            state['nextAgent'] = next_agent
+            state['nextAgent'] = state['moderatorName']
         
         # Add debugging info
         if 'debugging_info' not in state:
@@ -219,7 +225,7 @@ class FeedbackAgent(BaseAgent):
             'agent_name': self.name,
             'messages_sent': messages,
             'response': f"Final response: {response.content}",
-            'next_agent': next_agent
+            'next_agent': state['nextAgent']
         })
         
         return state
@@ -318,32 +324,29 @@ class SetupAgent:
         # Prepare the prompt
         prompt = (
             f"You are a setup agent. Based on the following setup information: '{setup_info}', and the available agents:\n{llm_descriptions}\n\n"
-            f"Determine how many agents are needed, what specific and complimentary roles they should play, and assign LLMs accordingly. Do not use a moderator unless one is specifically requested."
-            f"Pick a topology type from the following options:\n"
-            f"a) round_robin - no moderator\n"
-            f"b) last_decides_next - no moderator, the last agent decides the next agent based on context\n"
-            f"c) moderator_discretionary - with moderator, the moderator decides the next agent based on context\n"
-            f"d) moderated_round_robin - with moderator\n\n"
+            f"Determine how many agents are needed, what specific and complimentary roles they should play, and assign LLMs accordingly. Do not use a moderator unless one is specifically requested.\n\n"
             f"Provide a JSON configuration that includes:\n"
-            f"1. 'topology_type': One of 'round_robin', 'last_decides_next', 'moderator_discretionary', 'moderated_round_robin'.\n"
-            f"2. 'agents': A list of agents where:\n"
-            f"   - If topology_type is 'moderator_discretionary' or 'moderated_round_robin', the first agent MUST be the moderator agent with:\n"
+            f"1. 'agents': A list of agents where:\n"
+            f"   - If a moderator is requested, the first agent MUST be the moderator agent with:\n"
             f"     * 'name': 'Moderator'\n"
             f"     * 'type': The LLM to use for the moderator\n"
             f"     * 'role': A system prompt describing the moderator's role\n"
-            f"   - For all other agents (and all agents in non-moderated topologies):\n"
+            f"   - For all other agents:\n"
             f"     * 'name': The agent's friendly name\n"
             f"     * 'type': The LLM to use (from the available agents)\n"
             f"     * 'role': The system prompt for the agent that describes who the agent is\n"
-            f"3. If the topology type includes a moderator, include 'moderator_prompt': A proposed system prompt for the moderator, which includes how the moderator should focus the discussion, the names and roles (not model type) of the agents. Be sure to use the word agent in describing the agents and be very precise in repeating any relevant setup information.\n\n"
+            f"2. If a moderator is requested, include 'moderator_prompt': A proposed system prompt for the moderator, which includes how the moderator should focus the discussion, the names and roles (not model type) of the agents. Be sure to use the word agent in describing the agents and be very precise in repeating any relevant setup information.\n\n"
             f"Please return the JSON without any additional text or formatting."
-)
+        )
 
         response = self.llm.invoke([HumanMessage(content=prompt)])
         try:
             # Clean response content by removing code fences
             cleaned_content = clean_response(response.content)
             setup_data = json.loads(cleaned_content)
+            
+            # Add topology_type as empty string - will be set by user selection
+            setup_data['topology_type'] = ''
             return setup_data
         except (json.JSONDecodeError, KeyError) as e:
             raise ValueError(f"Failed to parse setup data: {e}")

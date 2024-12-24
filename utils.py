@@ -62,12 +62,3 @@ def format_messages(messages, suppressToolMsg=True) -> str:
     else:
         return "\n\n".join([f"{m.content}" for m in messages])
 
-def should_continue(state):
-    nextState = state.get('nextAgent', 'END')
-    if nextState.upper() == 'END':
-        nextState = END
-    if nextState is None or nextState =='none':
-        ProblemState = True
-        nextState = END
-
-    return nextState
