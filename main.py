@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Tuple
 import time
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from llms import available_llms, openai_llm
-from config import debugme, TOOLPREFIX, moderatorPromptEnd
+from config import debugme, TOOLPREFIX, moderatorPromptEnd, PROMPT_LENGTH_THRESHOLD
 from utils import clean_response, format_messages
 from agents import SetupAgent, FeedbackAgent, ModeratorAgent
 from tools import ResearchTool
@@ -26,15 +26,24 @@ setup_agent = SetupAgent(openai_llm)
 
 def setup_conversation(setup_info: str):
     """
-    Generates the conversation setup: topology_type, agents, moderator_prompt
-    Returns them in a tuple for direct assignment to the 3 Gradio outputs.
+    Generates the conversation setup and handles UI state clearing.
+    Returns tuple of (agents_df, moderator_prompt, conversation_output, debug_output, 
+    report_output, conversation_store, radio_update, moderator_response).
     """
     try:
         setup_data = setup_agent.generate_setup(setup_info)
     except ValueError as e:
-        return "Error in setup generation: " + str(e), [], ""
+        return (
+            [], 
+            "",
+            "Error in setup generation: " + str(e),  # conversation output
+            "",  # debug output
+            "",  # report output
+            None,  # conversation store
+            gr.update(value=None, choices=[]),  # radio buttons
+            gr.update(value="")  # moderator response
+        )
 
-    topology_type = setup_data.get('topology_type', '')
     agents = setup_data.get('agents', [])
     moderator_prompt = setup_data.get('moderator_prompt', '')
 
@@ -46,7 +55,17 @@ def setup_conversation(setup_info: str):
         [agent['name'], agent['type'], agent['role']] 
         for agent in agents
     ]
-    return topology_type, agents_df, moderator_prompt
+
+    return (
+        agents_df,
+        moderator_prompt,
+        "",  # Clear conversation output
+        "",  # Clear debugging output
+        "",  # Clear report output
+        None,  # Clear conversation store state
+        gr.update(value=None, choices=[]),  # Clear radio buttons
+        gr.update(value="")  # Clear moderator response
+    )
 
 
 
@@ -253,6 +272,14 @@ def run_conversation_init(
     # Ensure a moderator is present if needed
     if topology_type in ['moderator_discretionary', 'moderated_round_robin'] and moderator_agent is None:
         return ("Error: No moderator found in agents list.", "", "", {})
+
+    # Find moderator name from agents list
+    moderatorName = ""
+    for agent_info in agents_list:
+        name = agent_info['name']
+        if 'moderator' in name.lower():
+            moderatorName = name
+            break
 
     # Initialize state
     state: AgentState = {
@@ -464,27 +491,18 @@ with gr.Blocks(css="""
     ############################################################################
     # Setup button logic: call setup_conversation
     ############################################################################
-    def do_setup_conversation(setup_info):
-        """
-        Call setup_conversation to get (topology_type, agents_df, moderator_prompt).
-        If error, return string in the first slot and blank in others.
-        """
-        result = setup_conversation(setup_info)
-        if isinstance(result, tuple) and len(result) == 3:
-            # Keep the user-selected topology instead of the LLM's suggestion
-            topology_type, agents, prompt = result
-            return topology_dropdown.value, agents, prompt
-        else:
-            # error string
-            return result, [], ""
-
     setup_button.click(
-        fn=do_setup_conversation,
+        fn=setup_conversation,
         inputs=setup_info_input,
         outputs=[
-            topology_dropdown,
             agents_dataframe,
-            moderator_prompt_textbox
+            moderator_prompt_textbox,
+            conversation_output,
+            debugging_output,
+            report_output,
+            conversation_store_state,
+            which_agent_next,
+            human_moderator_response
         ]
     )
 
@@ -635,16 +653,30 @@ with gr.Blocks(css="""
         3) If we just ran a feedback agent, also run the moderator's response
         4) Return updated conversation, debugging, possibly final report if ended
         """
+        # Check if next agent is selected when using override
+        if not user_next_agent:
+            return (
+                gr.update(value="ERROR: You must select which agent should respond next before continuing."),
+                gr.update(),  # Keep debugging output unchanged
+                gr.update(),  # Keep report output unchanged
+                conversation_store,  # Keep conversation store unchanged
+                gr.update(),  # Keep radio buttons unchanged
+                gr.update()  # Keep moderator response unchanged
+            )
+
         # 1) apply override
+        # Only prepend agent name if not already present
+        if user_next_agent:
+            text_lower = user_moderator_text.strip().lower()
+            agent_lower = user_next_agent.lower()
+            if not text_lower.startswith(agent_lower):
+                user_moderator_text = f"{user_next_agent}, {user_moderator_text}"
+
         updated_store = apply_moderator_override(
             conversation_store, 
             user_moderator_text, 
             user_next_agent
         )
-
-        # Ensure user_moderator_text starts with the next agent's name
-        if user_next_agent and not user_moderator_text.startswith(user_next_agent):
-            user_moderator_text = f"{user_next_agent}, {user_moderator_text}"
 
         # 2) run one iteration of feedback agent with the override moderator text
         updated_store = run_conversation_iter(updated_store)
@@ -666,6 +698,9 @@ with gr.Blocks(css="""
                 if isinstance(last_msg, (AIMessage, HumanMessage)):
                     ai_mod_response = last_msg.content.replace("Moderator: ", "", 1)
                     ai_next_agent = updated_store["state"]["nextAgent"]
+        else:
+            ai_mod_response = ""
+            ai_next_agent = state["nextAgent"]
 
         # Build conversation output
         state = updated_store["state"]
@@ -709,9 +744,10 @@ with gr.Blocks(css="""
             debugging_output, 
             report_output, 
             conversation_store_state,
-            which_agent_next,  # Add this output
-            human_moderator_response  # Add this output
+            which_agent_next,
+            human_moderator_response
         ]
     )
 
 demo.launch(share=False)
+

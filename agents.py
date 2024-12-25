@@ -7,7 +7,7 @@ import json
 from utils import clean_response
 from llms import openai_llm, openai_llm_mini, available_llms
 from tools import Tool
-from config import TOOLPREFIX, debugme
+from config import TOOLPREFIX, debugme, PROMPT_LENGTH_THRESHOLD
 from state import AgentState
 
 # Base Agent class to handle common functionality
@@ -203,8 +203,11 @@ class FeedbackAgent(BaseAgent):
         response = self.llm.invoke(messages)
         
         # Step 4: Add response to conversation
-        response_message = f"{self.name}: {response.content}"
-        state['conversation_messages'].append(AIMessage(content=response_message))
+        final_response_text = response.content
+        # Prevent duplicate agent name prefix
+        if not final_response_text.strip().lower().startswith(self.name.lower()):
+            final_response_text = f"{self.name}: {final_response_text}"
+        state['conversation_messages'].append(AIMessage(content=final_response_text))
         
         # Step 5: Determine next agent based on topology
         if self.topology == 'last_decides_next':
@@ -257,6 +260,15 @@ class ModeratorAgent(BaseAgent):
 
     def generate_response(self, state: AgentState) -> AgentState:
         messages = [SystemMessage(content=self.system_message)] + state['conversation_messages']
+
+        # If prompt length too large, remind to ONLY respond in JSON
+        total_length = sum(len(m.content) for m in messages)
+        if total_length > PROMPT_LENGTH_THRESHOLD:
+            messages.append(HumanMessage(
+                content="IMPORTANT REMINDER: You must ONLY respond in JSON. "
+                        "If your JSON is invalid or you provide additional commentary, the request fails."
+            ))
+
         response = self.llm.invoke(messages)
 
         max_retries = 3
@@ -345,26 +357,8 @@ class SetupAgent:
             cleaned_content = clean_response(response.content)
             setup_data = json.loads(cleaned_content)
             
-            # Add topology_type as empty string - will be set by user selection
-            setup_data['topology_type'] = ''
+
             return setup_data
         except (json.JSONDecodeError, KeyError) as e:
             raise ValueError(f"Failed to parse setup data: {e}")
 
-    def recalculate_moderator_prompt(self, setup_info: str, topology_type: str, agents: List[Dict[str, Any]]) -> str:
-        if topology_type not in ['moderator_discretionary', 'moderated_round_robin']:
-            return ""
-
-        # Prepare the agents list as a string
-        agents_str = "\n".join([f"{agent['name']}: {agent['role']}" for agent in agents])
-
-        # Prepare the prompt
-        prompt = (
-            f"You are a setup agent. Based on the following setup information: '{setup_info}', the topology type '{topology_type}', and the agents:\n{agents_str}\n\n"
-            f"Generate a proposed system prompt for the moderator, which includes the goal for the discussion, the goal for feedback agent participation order.\n\n"
-            f"Please return the moderator prompt without any additional text or formatting."
-        )
-
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-        moderator_prompt = clean_response(response.content)
-        return moderator_prompt

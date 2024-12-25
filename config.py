@@ -22,3 +22,4 @@ moderatorPromptEnd = (f"Respond in the following JSON format:\n"
     '   "final_thoughts": "Your final thoughts on the conversation.",\n'
     "}"
 )
+PROMPT_LENGTH_THRESHOLD = 2500
