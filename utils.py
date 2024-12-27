@@ -3,7 +3,6 @@
 import re
 import json
 from langgraph.graph import Graph, END
- 
 
 def clean_response(content: str) -> str:
     """
@@ -62,3 +61,29 @@ def format_messages(messages, suppressToolMsg=True) -> str:
     else:
         return "\n\n".join([f"{m.content}" for m in messages])
 
+def clean_extracted_text(text: str) -> str:
+    """
+    Clean extracted text by removing navigation/UI lines and short lines.
+    Shared by both the Google-based research tool and the Reddit sentiment tool.
+    """
+    lines = text.split('\n')
+    cleaned_lines = []
+
+    for line in lines:
+        line = line.strip()
+        # Skip empty lines or very short lines
+        if len(line) < 4:
+            continue
+        # Skip lines that are likely navigation or UI elements
+        if len(line.split()) < 3:
+            continue
+        if any(nav in line.lower() for nav in ['menu', 'search', 'skip to', 'cookie', 'privacy policy']):
+            continue
+        cleaned_lines.append(line)
+
+    # Join lines back together
+    text = ' '.join(cleaned_lines)
+    # Remove multiple spaces
+    text = ' '.join(text.split())
+
+    return text
