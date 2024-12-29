@@ -4,21 +4,20 @@ import gradio as gr
 from typing import List, Dict, Any, Tuple
 import time
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from llms import available_llms, openai_llm
+from llms import available_llms, sota_llm, create_llm
 from config import debugme, TOOLPREFIX, moderatorPromptEnd, PROMPT_LENGTH_THRESHOLD
 from utils import clean_response, format_messages
 from agents import SetupAgent, FeedbackAgent, ModeratorAgent
 from tools import ResearchTool
+from sentiment import RedditSentimentTool  # NEW import for the Reddit sentiment tool
 from state import AgentState
 import copy
-
 
 ###############################################################################
 # SETUP AGENT
 ###############################################################################
 
-setup_agent = SetupAgent(openai_llm)
-
+setup_agent = SetupAgent(sota_llm)
 
 ###############################################################################
 # HELPER FUNCTIONS
@@ -50,9 +49,9 @@ def setup_conversation(setup_info: str):
     if moderator_prompt != '':
         moderator_prompt += moderatorPromptEnd
 
-    # Convert agents to list-of-lists for the Gradio dataframe
+    # Convert to list-of-lists for the Gradio dataframe, adding temperature=0
     agents_df = [
-        [agent['name'], agent['type'], agent['role']] 
+        [agent['name'], agent['type'], agent['role'], 0.0] 
         for agent in agents
     ]
 
@@ -67,12 +66,9 @@ def setup_conversation(setup_info: str):
         gr.update(value="")  # Clear moderator response
     )
 
-
-
 def collect_debugging_text(state: AgentState) -> str:
     """
     Aggregates debugging_info from the state into a single text string.
-    We store 'next_agent' properly so it's never 'Not specified' unless it truly is missing.
     """
     output_debug = ""
     if debugme == 1 and "debugging_info" in state:
@@ -87,7 +83,6 @@ def collect_debugging_text(state: AgentState) -> str:
             output_debug += f"\nNext Agent: {next_agent}"
     return output_debug
 
-
 def produce_report_if_requested(
     state: AgentState, 
     prepare_report: bool, 
@@ -95,7 +90,7 @@ def produce_report_if_requested(
     council_question: str
 ) -> str:
     """
-    Optionally produce a final report using openai_llm, if requested.
+    Optionally produce a final report using sota_llm, if requested.
     """
     if not prepare_report:
         return ""
@@ -109,9 +104,8 @@ def produce_report_if_requested(
         f"{report_prompt}\n\n"
         f"Conversation and Tool Outputs:\n{conversation_transcript}"
     )
-    response = openai_llm.invoke([HumanMessage(content=report_prompt)])
+    response = sota_llm.invoke([HumanMessage(content=report_prompt)])
     return response.content.strip()
-
 
 ###############################################################################
 # ONE-STEP CHAIN EXECUTION
@@ -123,12 +117,10 @@ def run_conversation_iter(conversation_store: dict) -> dict:
     """
     # Make a deep copy of the state to ensure we don't accidentally modify the original
     state = copy.deepcopy(conversation_store["state"])
-    max_iterations = conversation_store["max_iterations"]
-    iteration_count = conversation_store["iteration_count"]
 
     if state["nextAgent"] == "END":
         return conversation_store
-    if iteration_count >= max_iterations:
+    if conversation_store["iteration_count"] >= conversation_store["max_iterations"]:
         state["nextAgent"] = "END"
         conversation_store["state"] = state
         return conversation_store
@@ -143,8 +135,18 @@ def run_conversation_iter(conversation_store: dict) -> dict:
         current_agent = conversation_store["moderator_agent"]
     
     if current_agent:
+        # Check if we've hit the tool invocation limit
+        if state.get('tool_invocation_count', 0) >= state.get('max_tool_invocations', float('inf')):
+            # Remove tools from the agent temporarily
+            current_agent.available_tools = []
+        
         # Execute the current agent's response generation
         updated_state = current_agent.generate_response(state)
+        
+        # Restore tools to the agent if we removed them
+        if not current_agent.available_tools:
+            current_agent.available_tools = conversation_store.get("original_tools", [])
+            
         # Ensure we preserve any new messages
         conversation_store["state"] = updated_state
     else:
@@ -175,7 +177,6 @@ def apply_moderator_override(
     conversation_store["state"] = state
     return conversation_store
 
-
 ###############################################################################
 # MAIN ENTRYPOINT
 ###############################################################################
@@ -184,7 +185,7 @@ def run_conversation_init(
     setup_info: str,
     council_question: str,
     topology_type: str,
-    agents_df: List[List[str]],
+    agents_list: List[Dict[str, Any]],
     moderator_prompt: str,
     max_iterations: int,
     suppress_webpage_popups: bool,
@@ -194,7 +195,8 @@ def run_conversation_init(
     suppressResearch: bool,
     prepare_report: bool,
     reporterPrompt: str,
-    human_moderator_override: bool
+    human_moderator_override: bool,
+    max_tool_invocations: int
 ) -> Tuple[str, str, str, dict]:
     """
     Initializes the conversation:
@@ -204,31 +206,14 @@ def run_conversation_init(
       - If override=ON, runs exactly one iteration and returns partial results.
     Returns (conversation_output, debugging_output, report_output, conversation_store).
     """
-    # Convert agents_df to list of dicts
-    if hasattr(agents_df, "values"):
-        # if it's a Pandas DataFrame-like object
-        agents_rows = agents_df.values.tolist()
-    else:
-        agents_rows = agents_df
-
-    agents_list = []
-    for row in agents_rows:
-        if len(row) >= 3:
-            agents_list.append({
-                'name': row[0].strip(),
-                'type': row[1].strip(),
-                'role': row[2].strip()
-            })
-
-    if not agents_list:
-        return ("Error: No valid agents provided.", "", "", {})
-
     # Build agent objects
     agent_objects = {}
     moderator_agent = None
     moderatorName = ""
+
     available_tools = []
     if not disable_tools:
+        # Add the standard research tool
         available_tools.append(
             ResearchTool(
                 dismissPopups=suppress_webpage_popups,
@@ -236,20 +221,20 @@ def run_conversation_init(
                 max_total_image_interpretations=max_total_image_interpretations
             )
         )
+        # Add the new Reddit sentiment tool
+        available_tools.append(
+            RedditSentimentTool()
+        )
 
     for agent_info in agents_list:
         name = agent_info['name']
         llm_type = agent_info['type']
         role = agent_info['role']
+        temperature = agent_info.get('temperature', 0.0)  # Get temperature with default 0
         isModerator = ('moderator' in name.lower())
 
-        # Find the LLM
-        llm = next(
-            (available_llm['llm'] for available_llm in available_llms if available_llm['name'] == llm_type),
-            None
-        )
-        if llm is None:
-            return (f"Error: LLM '{llm_type}' not found for agent '{name}'", "", "", {})
+        # Create the LLM with the specified temperature
+        llm = create_llm(llm_type, temperature)
 
         if topology_type in ['moderator_discretionary', 'moderated_round_robin'] and isModerator:
             moderator_agent = ModeratorAgent(llm, available_tools)
@@ -293,7 +278,9 @@ def run_conversation_init(
         "agents": agents_list,
         "control_flow_index": 0,
         "debugging_info": [],
-        "moderatorName": moderatorName
+        "moderatorName": moderatorName,
+        "tool_invocation_count": 0,
+        "max_tool_invocations": max_tool_invocations
     }
 
     # Set initial nextAgent based on topology
@@ -319,7 +306,9 @@ def run_conversation_init(
         "iteration_count": 0,
         "prepare_report": prepare_report,
         "reporterPrompt": reporterPrompt,
-        "override_active": human_moderator_override
+        "override_active": human_moderator_override,
+        "tool_invocation_count": 0,
+        "max_tool_invocations": max_tool_invocations
     }
 
     # If override=OFF, run entire conversation automatically
@@ -432,10 +421,21 @@ with gr.Blocks(css="""
 
     with gr.Row():
         agents_dataframe = gr.Dataframe(
-            headers=['name', 'type', 'role'],
-            datatype=['str', 'str', 'str'],
+            headers=['name', 'type', 'role', 'temperature'],
+            datatype=['str', 'str', 'str', 'number'],
             interactive=True,
-            label="Agents (Name, Type, Role)"
+            label="Agents (Name, Type, Role, Temperature)",
+            value=[["", "", "", 0.0]]
+        )
+
+    # Add new table for Available LLMs
+    with gr.Row():
+        llms_dataframe = gr.Dataframe(
+            headers=['model type', 'model description'],
+            datatype=['str', 'str'],
+            interactive=False,
+            label="Available LLMs",
+            value=[[llm['name'], llm.get('description', 'No description available')] for llm in available_llms]
         )
 
     with gr.Row():
@@ -448,6 +448,13 @@ with gr.Blocks(css="""
         step=1,
         value=5,
         label="Max Iterations"
+    )
+    max_tool_invocations = gr.Slider(
+        minimum=0,
+        maximum=20,
+        step=1,
+        value=3,
+        label="Max Tool Invocations"
     )
     run_button = gr.Button("Begin Conversation")
 
@@ -548,18 +555,39 @@ with gr.Blocks(css="""
         suppress_research_val,
         prepare_report_val,
         report_instructions_val,
-        override_val
+        override_val,
+        max_tool_invocations_val
     ):
         """
         Calls run_conversation_init. If override=OFF, it returns the final 
         conversation. If override=ON, it returns a partial after 1 iteration.
         Then we set the which_agent_next's choices to the full agent names (except Moderator).
         """
+        # Convert agents DataFrame to list of dicts with temperature
+        agent_configs = []
+        if isinstance(agents_df_val, list):  # If it's a list of lists
+            for row in agents_df_val:
+                if len(row) >= 4:  # Ensure row has name, type, role, temperature
+                    agent_configs.append({
+                        'name': row[0].strip(),
+                        'type': row[1].strip(),
+                        'role': row[2].strip(),
+                        'temperature': float(row[3]) if row[3] else 0.0
+                    })
+        else:  # If it's a DataFrame
+            for _, row in agents_df_val.iterrows():
+                agent_configs.append({
+                    'name': row[0].strip(),
+                    'type': row[1].strip(),
+                    'role': row[2].strip(),
+                    'temperature': float(row[3]) if row[3] else 0.0
+                })
+
         conv_out, debug_out, rep_out, conv_store = run_conversation_init(
             setup_info,
             council_question,
             topology_type_val,
-            agents_df_val,
+            agent_configs,  # Pass the enhanced agent configs
             moderator_prompt_val,
             max_iterations_val,
             suppress_popups_val,
@@ -569,7 +597,8 @@ with gr.Blocks(css="""
             suppress_research_val,
             prepare_report_val,
             report_instructions_val,
-            override_val
+            override_val,
+            max_tool_invocations_val
         )
 
         # Build the list of agent names from the DataFrame
@@ -627,7 +656,8 @@ with gr.Blocks(css="""
             suppress_research,
             prepare_report,
             report_instructions,
-            human_moderator_override
+            human_moderator_override,
+            max_tool_invocations
         ],
         outputs=[
             conversation_output,

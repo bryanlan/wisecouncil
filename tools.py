@@ -13,6 +13,7 @@ import traceback
 import copy
 from PIL import Image
 from urllib.parse import quote_plus
+from pathlib import Path
 
 from googleapiclient.discovery import build
 from readability import Document
@@ -28,9 +29,9 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
 from langchain_core.messages import HumanMessage
-from llms import openai_llm, openai_llm_mini
-from utils import clean_response
-from config import keys  # Assuming keys is imported from config
+from utils import clean_response, clean_extracted_text
+from config import keys, TOKEN_LIMIT_FOR_SUMMARY
+from llms import sota_llm, cheap_llm  
 
 class Tool:
     def __init__(self, name: str, description: str, func):
@@ -39,10 +40,14 @@ class Tool:
         self.func = func
 
     def invoke(self, input_data: str) -> str:
+        """
+        Main method to be called by the Agents or Moderator. 
+        It delegates to the assigned 'func'.
+        """
         return self.func(input_data)
-    
+
 class ResearchTool(Tool):
-    def __init__(self,max_total_image_interpretations: int = 10, max_interpretations_per_page: int = 4, dismissPopups=True):
+    def __init__(self, max_total_image_interpretations: int = 10, max_interpretations_per_page: int = 4, dismissPopups=True):
         super().__init__(
             name="do_research",
             description="Perform internet research on a given query",
@@ -60,24 +65,22 @@ class ResearchTool(Tool):
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-        # Inside the __init__ method of ResearchTool
-        # Inside the __init__ method of ResearchTool
         self.popup_selectors = [
-        "button.accept-cookies",
-        "button.cookie-consent-accept",
-        "button#accept",
-        "button#cookieAccept",
-        "button[class*='accept']",
-        "button[class*='agree']",
-        "button[class*='consent']",
-        "button[class*='close']",
-        ".cookie-consent button",
-        ".cookie-banner button",
-        ".modal-footer button.btn-primary",
-        ".popup-close",
-        ".overlay-close",
-        # Add more selectors as needed
-    ]
+            "button.accept-cookies",
+            "button.cookie-consent-accept",
+            "button#accept",
+            "button#cookieAccept",
+            "button[class*='accept']",
+            "button[class*='agree']",
+            "button[class*='consent']",
+            "button[class*='close']",
+            ".cookie-consent button",
+            ".cookie-banner button",
+            ".modal-footer button.btn-primary",
+            ".popup-close",
+            ".overlay-close",
+            # Add more selectors as needed
+        ]
 
         self.alert_texts = [
             "Allow",
@@ -98,19 +101,38 @@ class ResearchTool(Tool):
         self.max_total_image_interpretations = max_total_image_interpretations
         self.max_interpretations_per_page = max_interpretations_per_page
         self.total_image_interpretations = 0
-        # Initialize extracted texts accumulator
-        self.accumulated_extracted_texts = []  # Accumulates all extracted texts per search
         self.has_successful_search = False  # Add this line
 
+        self.log_dir = Path("logs")
+        self.log_dir.mkdir(exist_ok=True)
+        self.research_counter = 0
 
-    
+    def setup_driver(self):
+        chrome_options = Options()
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--window-size=1920,1080')
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36')
+        
+        # Add these options to reduce noise
+        chrome_options.add_argument('--log-level=3')  # Fatal only
+        chrome_options.add_argument('--silent')
+        chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+
+        # Add the unsafe swiftshader flag
+        chrome_options.add_argument('--enable-unsafe-swiftshader')
+        
+        service = Service(ChromeDriverManager().install())
+        self.driver = webdriver.Chrome(service=service, options=chrome_options)
 
     def _dismiss_popups(self):
         """
         Attempts to dismiss common popups/dialogs on the current page.
         """
-        max_attempts = 3  # Number of times to attempt popup dismissal
-        wait_time = 5     # Increased wait time to 5 seconds
+        max_attempts = 3
+        wait_time = 5
         attempts = 0
 
         try:
@@ -140,7 +162,7 @@ class ResearchTool(Tool):
                                 time.sleep(0.5)
                                 popup_found = True
                     except:
-                        continue  # Continue to next selector if none found
+                        continue
 
                 # Dismiss popups via button texts using XPath
                 for text in self.alert_texts:
@@ -156,12 +178,11 @@ class ResearchTool(Tool):
                                 time.sleep(0.5)
                                 popup_found = True
                     except:
-                        continue  # Continue to next text if none found
+                        continue
 
-                # Optional: Remove popups via JavaScript
+                # Optional: Remove popups via JS
                 self._remove_popups_via_js()
 
-                # Break the loop if no popups were found in this iteration
                 if not popup_found:
                     break
 
@@ -184,481 +205,15 @@ class ResearchTool(Tool):
         except Exception as e:
             print(f"Error executing JS to remove popups: {str(e)}")
 
-
-    def setup_driver(self):
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36')
-        
-        # Add these options to reduce noise
-        chrome_options.add_argument('--log-level=3')  # Fatal only
-        chrome_options.add_argument('--silent')
-        chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
-
-        # Add the unsafe swiftshader flag
-        chrome_options.add_argument('--enable-unsafe-swiftshader')
-        
-        service = Service(ChromeDriverManager().install())
-        self.driver = webdriver.Chrome(service=service, options=chrome_options)
-
-    def _extract_content(self, url: str, title: str, snippet: str, query: str) -> tuple:
-        try:
-            image_reading_needed = False
-            self.driver.get(url)
-            print(f"Navigated to URL: {url}")
-            time.sleep(2)  # Wait for the page to load
-
-            response = requests.get(url, headers=self.headers, timeout=10)
-            response.raise_for_status()
-            
-            # Use readability to get the main content
-            doc = Document(response.text)
-            
-            # Try to extract publication date from meta tags first
-            pub_date = None
-            confidence = 'low'
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Check common meta tags for date
-            for meta in soup.find_all('meta'):
-                property_val = meta.get('property', '')
-                name_val = meta.get('name', '')
-                if any(date_tag in (property_val, name_val) for date_tag in [
-                    'article:published_time',
-                    'datePublished',
-                    'publication_date',
-                    'date',
-                    'pubdate'
-                ]):
-                    pub_date = meta.get('content')
-                    confidence = 'high'
-                    break
-            
-            # Get the main content
-            content = doc.summary()
-            
-            # Use justext to remove boilerplate content
-            paragraphs = justext.justext(content, justext.get_stoplist("English"))
-            content_parts = []
-            for paragraph in paragraphs:
-                if not paragraph.is_boilerplate:
-                    content_parts.append(paragraph.text)
-            
-            # Convert HTML to plain text
-            h = html2text.HTML2Text()
-            h.ignore_links = True
-            h.ignore_images = True
-            h.ignore_emphasis = True
-            text_content = h.handle(' '.join(content_parts))
-            
-            # Clean up the text
-            clean_text = self._clean_text(text_content)
-
-            # If no text content was extracted, set image_reading_needed flag
-            if not clean_text.strip():
-                print(f"No text content extracted from {url}, will defer image reading.")
-                image_reading_needed = True
-                # Do not proceed to _extract_content_with_scrolling()
-              
-            # If no date found in meta tags, use GPT to extract date using the full content
-            if not pub_date and not image_reading_needed:
-                current_date = datetime.datetime.now()
-                pub_date, confidence = self._extract_date_with_gpt(
-                    url=url,
-                    title=title,
-                    snippet=snippet,
-                    content=clean_text,
-                    current_date=current_date
-                )
-            
-            if not image_reading_needed:
-                 # Format and prepend title and date if available
-                formatted_text = f"Title: {title}\n"
-                if pub_date:
-                    formatted_text += f"Date: {pub_date}\n"
-                formatted_text += f"Content:\n{clean_text}\n"
-            
-            # Accumulate the formatted text
-                self.accumulated_extracted_texts.append(formatted_text)
-
-            
-            return clean_text, pub_date, confidence, image_reading_needed
-
-        except Exception as e:
-            print(f"Error extracting content from {url}: {str(e)}")
-            return "", None, 'low', False
-
-    def _check_continue_interpretation(self, total_info: str, current_page_info: str, query: str) -> bool:
-        try:
-            prompt = (
-                f"Here is the information extracted so far from all pages:\n{total_info}\n\n"
-                f"Here is the information extracted from the current page:\n{current_page_info}\n\n"
-                f"The original query is: '{query}'.\n\n"
-                f"Based on the information extracted, should we perform another image interpretation to extract more information? Say yes if you believe more useful information to help the query is likely to come from the current page."
-                f"Respond with ONLY 'yes - we should do another extraction' or 'no - we've received all of the useful info' and a brief description of your reason."
-            )
-            
-            response = openai_llm_mini.invoke([HumanMessage(content=prompt)])
-            decision = response.content.strip().lower()
-            
-            if 'yes' in decision:
-                print(f"Will do another extraction because {decision}")
-                return True
-                
-            elif 'no' in decision:
-                print(f"Will not do another extraction because {decision}")
-                return False
-            else:
-                # Default to not continue if unclear
-                print("GPT response unclear. Defaulting to stop further interpretations.")
-                return False
-
-        except Exception as e:
-            print(f"Error during GPT decision-making: {str(e)}")
-            # Default to not continue on error
-            return False
-
-    def _extract_content_with_scrolling(self, url: str, query: str) -> str:
-        try:
-            self.driver.get(url)
-            time.sleep(2)  # Wait for the page to load
-
-            extracted_texts = []
-            current_page_image_interpretations = 0
-            max_screens = self.max_interpretations_per_page
-
-            for screen in range(max_screens):
-                if self.total_image_interpretations >= self.max_total_image_interpretations:
-                    print("Reached maximum total image interpretations.")
-                    break
-
-                # Capture screenshot
-                screenshot = self.driver.get_screenshot_as_png()
-                print(f"Captured screenshot {screen + 1} for {url}")
-                
-                # Extract text from the screenshot
-                text = self._extract_text_from_image_with_gpt(screenshot, query=query)
-                if text:
-                    extracted_texts.append(text)
-                    self.total_image_interpretations += 1
-                    current_page_image_interpretations += 1
-                    
-
-                    
-                    # Check with GPT whether to continue
-                    total_info = "\n".join(self.accumulated_extracted_texts)  # Accumulated across all pages
-                    current_page_info = "\n".join(extracted_texts)  # Accumulated on current page
-                    
-                    should_continue = self._check_continue_interpretation(
-                        total_info=total_info,
-                        current_page_info=current_page_info,
-                        query=query
-                    )
-                    
-                    if not should_continue:
-                        print("GPT advised to stop further image interpretations.")
-                        break
-
-                # Scroll down by the viewport height
-                if screen < max_screens - 1:
-                    self._scroll_down()
-                    time.sleep(2)  # Wait for new content to load
-
-            # Combine all extracted texts
-            combined_text = "\n".join(extracted_texts)
-            return combined_text
-
-        except Exception as e:
-            print(f"Error extracting content with scrolling from {url}: {str(e)}")
-            return ""
-
-    def _scroll_down(self):
-        try:
-            # Scroll down by the viewport height
-            scroll_script = "window.scrollBy(0, window.innerHeight);"
-            self.driver.execute_script(scroll_script)
-            print("Scrolled down by one viewport height.")
-        except Exception as e:
-            print(f"Error scrolling down: {str(e)}")
-
-    def _extract_text_from_image_with_gpt(self, image_data: bytes, query: str) -> str:
-        
-        bmp_filename = f"screenshot_{int(time.time())}.bmp"
-        try:
-            # Encode the image data to base64
-            image_base64 = base64.b64encode(image_data).decode('utf-8')
-            # Save the image data as a BMP file for debugging
-            image = Image.open(io.BytesIO(image_data))
-            image.save(bmp_filename, format='BMP')
-            print(f"Saved BMP file for debugging: {bmp_filename}")
-
-            # Create the message with the image
-            message = HumanMessage(
-                content=[
-                    {"type": "text", "text": f"Please extract all textual information from this image that is relevant to query:'{query}' and provide it as plain text. Respond with ONLY the extracted text."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
-                ]
-            )
-
-            # Invoke the model with the message
-            response = openai_llm_mini.invoke([message])
-
-            # Extract and return the text from the response
-            extracted_text = response.content.strip()
-            print("Extracted text from image.")
-            return extracted_text
-
-        except Exception as e:
-            print(f"Error extracting text from image with GPT: {str(e)}")
-            return ""
-        finally:
-        # Delete the BMP file immediately after processing
-            try:
-                if os.path.exists(bmp_filename):
-                    os.remove(bmp_filename)
-                    print(f"Deleted BMP file: {bmp_filename}")
-            except Exception as del_e:
-                print(f"Error deleting BMP file: {str(del_e)}")
-        
-    def _clean_text(self, text: str) -> str:
-        # Split into lines and clean
-        lines = text.split('\n')
-        cleaned_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            # Skip empty lines or very short lines
-            if len(line) < 4:
-                continue
-            # Skip navigation-like items
-            if len(line.split()) < 3:
-                continue
-            # Skip lines that are likely navigation or UI elements
-            if any(nav in line.lower() for nav in ['menu', 'search', 'skip to', 'cookie', 'privacy policy']):
-                continue
-            cleaned_lines.append(line)
-        
-        # Join lines back together
-        text = ' '.join(cleaned_lines)
-        
-        # Remove multiple spaces
-        text = ' '.join(text.split())
-        
-        return text
-    def _google_search(self, query: str, required_terms: list, excluded_terms: list, time_range: str, num_results: int = None):
-        print(f"Starting google_search with query: {query}")
-        all_results = []
-        processed_urls = set()
-        page_count = 0
-        max_pages = 3  # Maximum number of pages to try
-        
-        # Use provided num_results or default to MAX_RESULTS
-        target_results = num_results if num_results is not None else self.MAX_RESULTS
-        
-        try:
-            # Build initial search query without quotes
-            search_query = f'{query} -site:youtube.com -site:youtu.be -site:washingtonpost.com'
-            url = f"https://cse.google.com/cse?cx={self.search_engine_id}&q={quote_plus(search_query)}"
-            
-            self.driver.get(url)
-            
-            while page_count < max_pages:
-                # Wait for results
-                WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "gsc-result"))
-                )
-                time.sleep(3)
-
-                # Extract results from current page
-                js_script = """
-                const results = [];
-                const elements = document.querySelectorAll('.gsc-result');
-                elements.forEach(element => {
-                    const titleElement = element.querySelector('a.gs-title');
-                    const snippetElement = element.querySelector('.gs-snippet');
-                    if (titleElement && titleElement.href) {
-                        results.push({
-                            url: titleElement.href,
-                            title: titleElement.textContent,
-                            snippet: snippetElement ? snippetElement.textContent : ''
-                        });
-                    }
-                });
-                return results;
-                """
-                
-                page_results = self.driver.execute_script(js_script)
-                print(f"Found {len(page_results)} results on page {page_count + 1}")
-
-                # If no results found, check for previous successful search
-                if not page_results:
-                    print(f"No results found for URL: {url}")
-                    return []
-
-                # Filter out duplicates and invalid URLs
-                page_results = [
-                    result for result in page_results
-                    if result['url'] not in processed_urls
-                    and result['url'].startswith('http')
-                    and not any(domain in result['url'].lower() for domain in [
-                        'youtube.com', 'youtu.be', 'vimeo.com',
-                        'dailymotion.com', 'tiktok.com'
-                    ])
-                ]
-
-                # Only evaluate relevance if we have results
-                if page_results:
-                    # Evaluate results relevance
-                    highly_relevant, maybe_relevant = self._evaluate_search_results(page_results, query)
-                    
-                    # Process highly relevant results first
-                    for result in highly_relevant:
-                        if len(all_results) >= target_results:
-                            break
-                            
-                        try:
-                            url = result['url']
-                            processed_urls.add(url)
-                            
-                            print(f"Processing highly relevant URL: {url}")
-                            full_content, pub_date, confidence, image_reading_needed = self._extract_content(
-                                url, result['title'], result['snippet'], query
-                            )
-
-                            if full_content and len(full_content.split()) > 50:
-                                all_results.append({
-                                    'url': url,
-                                    'title': result['title'],
-                                    'snippet': result['snippet'],
-                                    'content': full_content,
-                                    'date': pub_date,
-                                    'date_confidence': confidence
-                                })
-                                print(f"Added highly relevant result: {url}")
-                        except Exception as e:
-                            print(f"Error processing result: {e}")
-                            continue
-
-                    # Check if we have minimum required results before proceeding
-                    if len(all_results) < self.MIN_RESULTS:
-                        # Process maybe relevant results if needed
-                        for result in maybe_relevant:
-                            if len(all_results) >= target_results:
-                                break
-                            try:
-                                url = result['url']
-                                processed_urls.add(url)
-                                
-                                print(f"Processing maybe relevant URL: {url}")
-                                full_content, pub_date, confidence, image_reading_needed = self._extract_content(
-                                    url, result['title'], result['snippet'], query
-                                )
-
-                                if full_content and len(full_content.split()) > 50:
-                                    all_results.append({
-                                        'url': url,
-                                        'title': result['title'],
-                                        'snippet': result['snippet'],
-                                        'content': full_content,
-                                        'date': pub_date,
-                                        'date_confidence': confidence
-                                    })
-                                    print(f"Added maybe relevant result: {url}")
-                            except Exception as e:
-                                print(f"Error processing result: {e}")
-                                continue
-
-                # Check if we need more results
-                if len(all_results) >= self.MIN_RESULTS and (
-                    len(all_results) >= target_results or 
-                    not self._should_load_more_results(all_results, query)
-                ):
-                    break
-
-                # Try to go to next page
-                if not self._click_next_page():
-                    break
-                    
-                page_count += 1
-
-            if len(all_results) > 0:
-                self.has_successful_search = True
-            return all_results
-
-        except Exception as e:
-            print(f"Search error: {e}")
-            return []
-
-    def _decide_to_process_deferred(self, query: str, time_range: str) -> bool:
-        accumulated_info = "\n".join(self.accumulated_extracted_texts)
-        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-        prompt = (
-            f"Given the following query: '{query}', today's date: {current_date}, time sensitivity of the required data: '{time_range}',\n"
-            f"and the information extracted so far:\n"
-            f"{accumulated_info}\n\n"
-            f"Do you have enough information to answer the query confidently?\n"
-            f"Would you benefit from taking significant extra processing time to extract more information from additional sources?\n"
-            f"Respond with 'yes - more info is needed' or 'no - I have enough info' and a brief justification."
-        )
-        response = openai_llm_mini.invoke([HumanMessage(content=prompt)])
-        decision = response.content.strip().lower()
-        if 'yes' in decision:
-            return True
-        elif 'no' in decision:
-            return False
-        else:
-            # Default to False if the response is unclear
-            print("GPT response unclear. Defaulting to not process deferred results.")
-            return False
-
-    def _process_deferred_result(self, result, query):
-        url = result['url']
-        title = result['title']
-        snippet = result['snippet']
-
-        print(f"Processing deferred URL with image reading: {url}")
-        full_content = self._extract_content_with_scrolling(url, query=query)
-        if not full_content.strip():
-            print(f"Could not extract content from {url} even with image reading.")
-            return
-
-        # Accumulate the cleaned text
-        self.accumulated_extracted_texts.append(full_content)
-
-        # Try to extract date
-        pub_date = None
-        confidence = 'low'
-        current_date = datetime.datetime.now()
-        pub_date, confidence = self._extract_date_with_gpt(
-            url=url,
-            title=title,
-            snippet=snippet,
-            content=full_content,
-            current_date=current_date
-        )
-
-        # Add the result to the main results list
-        self.results.append({
-            'url': url,
-            'title': title,
-            'snippet': snippet,
-            'content': full_content,
-            'date': pub_date,
-            'date_confidence': confidence
-        })
-        print(f"Added deferred result for: {url}")
-
     def _research_func(self, query: str) -> str:
         try:
-            print("Starting research function with query:", query)
-            # Reset global counters and accumulators at the start of each search
+            # Increment the research counter at the start of each new research
+            self.research_counter += 1
+            print(f"Starting research function with query: {query}")
+            # Reset global counters and accumulators
             self.total_image_interpretations = 0
             self.accumulated_extracted_texts = []
-            self.results = []  # Initialize results
+            self.results = []
 
             refined_query, required_terms, excluded_terms, time_range = self._refine_query(query)
             print("After refine_query")
@@ -666,7 +221,6 @@ class ResearchTool(Tool):
             results = self._google_search(refined_query, required_terms, excluded_terms, time_range)
             print(f"After google_search, got {len(results)} results")
             
-            # Add check for empty results
             if not results:
                 return "No relevant information found for the given query."
             
@@ -677,15 +231,6 @@ class ResearchTool(Tool):
             print(f"Error in research function: {e}")
             print(f"Full error details: {traceback.format_exc()}")
             return f"Error performing research: {str(e)}"
-
-
-    def __del__(self):
-        """Clean up the Selenium driver"""
-        if hasattr(self, 'driver'):
-            try:
-                self.driver.quit()
-            except:
-                pass
 
     def _refine_query(self, query: str) -> tuple:
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -711,7 +256,7 @@ class ResearchTool(Tool):
             "}"
         )
         
-        response = openai_llm.invoke([HumanMessage(content=prompt)])
+        response = sota_llm.invoke([HumanMessage(content=prompt)])
         try:
             result = json.loads(clean_response(response.content.strip()))
             return (
@@ -723,216 +268,138 @@ class ResearchTool(Tool):
         except json.JSONDecodeError:
             return query, [], [], "any"
 
-    def _clean_results(self, results):
-        cleaned_results = []
-        for result in results:
-            content = result['content']
-            # Remove incomplete sentences
-            sentences = content.split('.')
-            complete_sentences = [s.strip() + '.' for s in sentences if len(s.split()) > 5]
-            cleaned_content = ' '.join(complete_sentences)
-            
-            # Include publication date and URL in cleaned results
-            cleaned_results.append({
-                'url': result['url'],
-                'content': cleaned_content,
-                'date': result.get('date'),
-                'date_confidence':result.get('date_confidence',''),
-                'title': result.get('title', '')
-            })
-        return cleaned_results
-
-    def _standardize_date(self, date_str: str, current_date: datetime.datetime) -> tuple:
-        if not date_str:
-            return None, 'low'
-            
-        prompt = (
-            f"Convert this date string to a standardized format.\n"
-            f"Current date: {current_date.strftime('%Y-%m-%d')}\n"
-            f"Input date: {date_str}\n\n"
-            f"Return ONLY the result in this JSON format:\n"
-            "{\n"
-            '    "standardized_date": "YYYY-MM-DD",\n'  # Use null if can't determine
-            '    "confidence": "high/medium/low"\n'
-            "}\n\n"
-            f"Handle relative dates (e.g., '2 days ago', 'last week') using the current date.\n"
-            f"If you cannot determine a specific date, return null for standardized_date. Reminder ONLY return the JSON object, nothing else."
-        )
+    def _google_search(self, query: str, required_terms: list, excluded_terms: list, time_range: str, num_results: int = None):
+        print(f"Starting google_search with query: {query}")
+        all_results = []
+        processed_urls = set()
+        page_count = 0
+        max_pages = 3
+        
+        target_results = num_results if num_results is not None else self.MAX_RESULTS
         
         try:
-            response = openai_llm_mini.invoke([HumanMessage(content=prompt)])
-            result = json.loads(clean_response(response.content.strip()))
-            return result.get('standardized_date'), result.get('confidence', 'low')
-        except Exception as e:
-            print(f"Error standardizing date: {e}")
-            return None, 'low'
-
-    def _post_process(self, json_results: str, query: str) -> str:
-        try:
-
-            cleaned_results = self._clean_results(json_results)
-             # Sort results by date confidence and actual date
-            current_date = datetime.datetime.now()
-            for result in cleaned_results:
-                std_date, confidence = self._standardize_date(result.get('date'), current_date)
-                result['standardized_date'] = std_date
-                result['date_confidence'] = confidence
-                
-                if std_date:
-                    try:
-                        date = datetime.datetime.strptime(std_date, '%Y-%m-%d')
-                        result['age_days'] = (current_date - date).days
-                    except (ValueError, TypeError):
-                        result['age_days'] = float('inf')
-                else:
-                    result['age_days'] = float('inf')
-
-            # Sort by confidence first, then by age
-            cleaned_results.sort(
-                key=lambda x: (
-                    0 if x['date_confidence'] == 'high' else 1 if x['date_confidence'] == 'medium' else 2,
-                    x['age_days']
+            search_query = f'{query} -site:youtube.com -site:youtu.be -site:washingtonpost.com'
+            url = f"https://cse.google.com/cse?cx={self.search_engine_id}&q={quote_plus(search_query)}"
+            
+            self.driver.get(url)
+            
+            while page_count < max_pages:
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "gsc-result"))
                 )
-            )
+                time.sleep(3)
 
-            # Determine temporal requirements based on query
-            temporal_prompt = (
-                f"Analyze this query and determine its temporal requirements: '{query}'\n"
-                f"Respond ONLY in JSON format:\n"
-                "{\n"
-                '    "recency_importance": "critical/high/medium/low",\n'
-                '    "max_age_days": number,\n'
-                '    "requires_future_prediction": true/false\n'
-                "}"
-            )
-            
-            temporal_response = openai_llm_mini.invoke([HumanMessage(content=temporal_prompt)])
-            temporal_requirements = json.loads(clean_response(temporal_response.content.strip()))
-
-            # Sort and filter results based on temporal requirements
-            current_date = datetime.datetime.now()
-            processed_results = []
-            
-            for result in cleaned_results:
-                if result['age_days'] != float('inf'):
-                    if temporal_requirements['recency_importance'] == 'critical' and result['age_days'] > 30:
-                        continue
-                    elif temporal_requirements['recency_importance'] == 'high' and result['age_days'] > 90:
-                        continue
-                    elif temporal_requirements['max_age_days'] and result['age_days'] > temporal_requirements['max_age_days']:
-                        continue
+                js_script = """
+                const results = [];
+                const elements = document.querySelectorAll('.gsc-result');
+                elements.forEach(element => {
+                    const titleElement = element.querySelector('a.gs-title');
+                    const snippetElement = element.querySelector('.gs-snippet');
+                    if (titleElement && titleElement.href) {
+                        results.push({
+                            url: titleElement.href,
+                            title: titleElement.textContent,
+                            snippet: snippetElement ? snippetElement.textContent : ''
+                        });
+                    }
+                });
+                return results;
+                """
                 
-                processed_results.append(result)
+                page_results = self.driver.execute_script(js_script)
+                print(f"Found {len(page_results)} results on page {page_count + 1}")
 
+                if not page_results:
+                    print(f"No results found for URL: {url}")
+                    return []
 
-            # Prepare the data for final processing
-            
-        # Prepare content data with standardized dates
-            content_data = "\n\n".join([
-                f"Source: {item['url']}\n"
-                f"Date: {item.get('standardized_date', 'Unknown')} (Confidence: {item['date_confidence']})\n"
-                f"Content: {item['content']}"
-                for item in processed_results
-            ])
+                # Filter out duplicates or videos
+                page_results = [
+                    result for result in page_results
+                    if result['url'] not in processed_urls
+                    and result['url'].startswith('http')
+                    and not any(domain in result['url'].lower() for domain in [
+                        'youtube.com', 'youtu.be', 'vimeo.com',
+                        'dailymotion.com', 'tiktok.com'
+                    ])
+                ]
 
-            final_prompt = (
-                f"Analyze and synthesize the following search results for the query: '{query}'\n\n"
-                f"Temporal requirements:\n"
-                f"- Recency importance: {temporal_requirements['recency_importance']}\n"
-                f"- Requires future prediction: {temporal_requirements['requires_future_prediction']}\n\n"
-                f"Instructions:\n"
-                f"1. Synthesize the information into a comprehensive response that directly addresses the query\n"
-                f"2. When information conflicts, prefer more recent sources\n"
-                f"3. For predictive queries, base conclusions primarily on the most recent trends and data\n"
-                f"4. For historical or scientific queries, include relevant information across time periods\n"
-                f"5. Include temporal context when it adds value (e.g., 'As of November 2023...' or 'Research from 2022 showed...')\n"
-                f"6. Highlight any significant changes or trends over time\n"
-                f"7. Note any important temporal gaps or limitations in the data\n\n"
-                f"Data:\n{content_data}\n\n"
-                f"Provide a well-structured response that maintains the detail and nuance from the sources while "
-                f"organizing the information in a clear and logical way."
-            )
+                if page_results:
+                    highly_relevant, maybe_relevant = self._evaluate_search_results(page_results, query)
+                    
+                    for result in highly_relevant:
+                        if len(all_results) >= target_results:
+                            break
+                        try:
+                            url = result['url']
+                            processed_urls.add(url)
+                            
+                            print(f"Processing highly relevant URL: {url}")
+                            full_content, pub_date, confidence, image_reading_needed = self._extract_content(
+                                url, result['title'], result['snippet'], query
+                            )
+                            if full_content and len(full_content.split()) > 50:
+                                all_results.append({
+                                    'url': url,
+                                    'title': result['title'],
+                                    'snippet': result['snippet'],
+                                    'content': full_content,
+                                    'date': pub_date,
+                                    'date_confidence': confidence
+                                })
+                                print(f"Added highly relevant result: {url}")
+                        except Exception as e:
+                            print(f"Error processing result: {e}")
+                            continue
 
-            response = openai_llm_mini.invoke([HumanMessage(content=final_prompt)])
-            return response.content.strip()
+                    if len(all_results) < self.MIN_RESULTS:
+                        for result in maybe_relevant:
+                            if len(all_results) >= target_results:
+                                break
+                            try:
+                                url = result['url']
+                                processed_urls.add(url)
+                                
+                                print(f"Processing maybe relevant URL: {url}")
+                                full_content, pub_date, confidence, image_reading_needed = self._extract_content(
+                                    url, result['title'], result['snippet'], query
+                                )
+                                if full_content and len(full_content.split()) > 50:
+                                    all_results.append({
+                                        'url': url,
+                                        'title': result['title'],
+                                        'snippet': result['snippet'],
+                                        'content': full_content,
+                                        'date': pub_date,
+                                        'date_confidence': confidence
+                                    })
+                                    print(f"Added maybe relevant result: {url}")
+                            except Exception as e:
+                                print(f"Error processing result: {e}")
+                                continue
 
-        except Exception as e:
-            return f"Error during post-processing: {str(e)}" 
+                if len(all_results) >= self.MIN_RESULTS and (
+                    len(all_results) >= target_results or 
+                    not self._should_load_more_results(all_results, query)
+                ):
+                    break
 
-    def _extract_date_with_gpt(self, url: str, title: str, snippet: str, content: str, current_date: datetime.datetime) -> str:
-        try:
-            # Take the first 1000 characters of content to keep prompt size reasonable
-            content_preview = content[:1000] + ("..." if len(content) > 1000 else "")
-            
-            prompt = (
-                f"Given the following information about an article, determine its publication date.\n"
-                f"Current date: {current_date.strftime('%Y-%m-%d')}\n"
-                f"URL: {url}\n"
-                f"Title: {title}\n"
-                f"Snippet: {snippet}\n"
-                f"Article content preview: {content_preview}\n\n"
-                f"Look for:\n"
-                f"1. Explicit dates in the content\n"
-                f"2. Relative time references (e.g., '4 days ago', 'last week')\n"
-                f"3. References to current events or sports seasons\n"
-                f"4. Date-specific context (e.g., 'this season', 'upcoming game this Sunday')\n\n"
-                f"Return your best estimate of the publication date in this JSON format:\n"
-                "{\n"
-                '    "date": "YYYY-MM-DD",\n'
-                '    "confidence": "high/medium/low",\n'
-                '    "reasoning": "brief explanation of how you determined the date"\n'
-                "}\n\n"
-                f"If you cannot determine a date, use null for the date value. "
-                f"Ensure your response is ONLY the JSON object, nothing else."
-            )
+                if not self._click_next_page():
+                    break
+                    
+                page_count += 1
 
-            response = openai_llm_mini.invoke([HumanMessage(content=prompt)])
-            response_text = clean_response(response.content.strip())
-            
-            # Additional cleaning to ensure we have valid JSON
-            response_text = response_text.replace("```json", "").replace("```", "").strip()
-            
-            try:
-                result = json.loads(response_text)
-            except json.JSONDecodeError as e:
-                print(f"Invalid JSON response: {response_text}")
-                print(f"JSON error: {e}")
-                # Attempt to fix common JSON issues
-                response_text = response_text.replace("'", '"')  # Replace single quotes with double quotes
-                response_text = re.sub(r'(\w+):', r'"\1":', response_text)  # Add quotes around keys
-                try:
-                    result = json.loads(response_text)
-                except json.JSONDecodeError:
-                    print("Failed to parse JSON even after cleaning")
-                    return None, 'low'
-            
-            date = result.get('date')
-            confidence = result.get('confidence', 'low')
-            
-            # Validate the date format
-            if date:
-                try:
-                    datetime.datetime.strptime(date, '%Y-%m-%d')
-                except ValueError:
-                    print(f"Invalid date format received: {date}")
-                    return None, 'low'
-            
-            return date, confidence
+            if len(all_results) > 0:
+                self.has_successful_search = True
+            return all_results
 
         except Exception as e:
-            print(f"Error extracting date with GPT: {str(e)}")
-            print(f"Full response: {response.content if 'response' in locals() else 'No response'}")
-            return None, 'low'
+            print(f"Search error: {e}")
+            return []
 
     def _evaluate_search_results(self, search_results: List[Dict], query: str) -> Tuple[List[Dict], List[Dict]]:
-        """
-        Evaluate search results to determine which ones are most likely to be relevant.
-        Returns tuple of (likely_relevant, maybe_relevant) results.
-        """
         if not search_results:
             return [], []
-
-        # Prepare the evaluation prompt
         results_text = "\n\n".join([
             f"Result {i+1}:\n"
             f"Title: {result['title']}\n"
@@ -944,24 +411,19 @@ class ResearchTool(Tool):
         prompt = (
             f"Given this search query: '{query}'\n\n"
             f"Evaluate these search results and classify them into two categories:\n"
-            f"1. Highly relevant (likely to contain valuable information)\n"
-            f"2. Maybe relevant (might contain useful information)\n\n"
-            f"Consider:\n"
-            f"- How closely the title and snippet match the query intent\n"
-            f"- The credibility of the source\n"
-            f"- The likely freshness of the information\n"
-            f"- Whether the content appears to be substantive\n\n"
+            f"1. Highly relevant\n"
+            f"2. Maybe relevant\n\n"
             f"Search Results:\n{results_text}\n\n"
-            f"Respond in JSON format:\n"
+            f"Respond in JSON with:\n"
             "{\n"
-            '    "highly_relevant": [result_numbers],\n'
-            '    "maybe_relevant": [result_numbers],\n'
-            '    "reasoning": "brief explanation of key decisions"\n'
+            '   "highly_relevant": [result_numbers],\n'
+            '   "maybe_relevant": [result_numbers],\n'
+            '   "reasoning": "some justification"\n'
             "}"
         )
 
         try:
-            response = openai_llm_mini.invoke([HumanMessage(content=prompt)])
+            response = cheap_llm.invoke([HumanMessage(content=prompt)])
             result = json.loads(clean_response(response.content))
             
             highly_relevant = [search_results[i-1] for i in result['highly_relevant']]
@@ -969,25 +431,17 @@ class ResearchTool(Tool):
             
             print(f"Evaluation complete: {len(highly_relevant)} highly relevant, {len(maybe_relevant)} maybe relevant")
             print(f"Reasoning: {result['reasoning']}")
-            
             return highly_relevant, maybe_relevant
         except Exception as e:
             print(f"Error evaluating search results: {e}")
-            return search_results, []  # Return all results as highly relevant if evaluation fails
+            return search_results, []
 
     def _should_load_more_results(self, current_results: List[Dict], query: str) -> bool:
-        """
-        Determine if more search results should be loaded based on current findings.
-        """
-        # Don't load more if we've hit MAX_RESULTS
         if len(current_results) >= self.MAX_RESULTS:
             return False
-        
-        # Always load more if we haven't hit MIN_RESULTS
         if len(current_results) < self.MIN_RESULTS:
             return True
 
-        # Prepare summary of current results
         results_summary = "\n".join([
             f"- {result.get('title', 'Untitled')} ({result.get('date', 'Unknown date')})"
             for result in current_results
@@ -996,53 +450,364 @@ class ResearchTool(Tool):
         prompt = (
             f"Given this search query: '{query}'\n\n"
             f"Current results collected:\n{results_summary}\n\n"
-            f"Should we load more search results? Consider:\n"
-            f"1. Do we have enough diverse sources?\n"
-            f"2. Do we have recent enough information?\n"
-            f"3. Are there likely gaps in the current information?\n"
-            f"4. Would more results significantly improve the answer to the query?\n\n"
-            f"Respond with ONLY 'yes' or 'no' followed by a brief reason."
+            f"Should we load more search results? Return 'yes' or 'no'."
         )
 
         try:
-            response = openai_llm_mini.invoke([HumanMessage(content=prompt)])
+            response = cheap_llm.invoke([HumanMessage(content=prompt)])
             decision = response.content.lower().strip()
-            
             print(f"Load more decision: {decision}")
             return decision.startswith('yes')
         except Exception as e:
             print(f"Error in load more decision: {e}")
-            return len(current_results) < 5  # Default to yes if less than 5 results
+            return len(current_results) < 5
 
     def _click_next_page(self) -> bool:
-        """
-        Attempt to click the 'Next' button for search results.
-        Returns True if successful, False otherwise.
-        """
         try:
-            # Try multiple possible selectors for the next button
-            next_button_selectors = [
-                ".gsc-cursor-next-page",
-                "button.gsc-next",
-                "a.gsc-next",
-                "[aria-label='Next page']",
-                "[title='Next']"
-            ]
+            # Wait for results to load first
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "gsc-results"))
+            )
+            time.sleep(2)  # Add small delay to ensure page is fully loaded
             
+            # Get current page number for verification
+            try:
+                current_page = self.driver.find_element(By.CSS_SELECTOR, ".gsc-cursor-current-page")
+                current_page_num = int(current_page.text)
+            except:
+                current_page_num = 1
+
+            # Updated selectors with more specific targeting
+            next_button_selectors = [
+                f".gsc-cursor-page:nth-child({current_page_num + 1})",  # Next numbered page
+                ".gsc-cursor-page:not(.gsc-cursor-current-page)",  # Any non-current page
+                ".gsc-cursor-next-page",  # Next page arrow
+                "div.gsc-cursor-page:not(.gsc-cursor-current-page):last-of-type"  # Last non-current page
+            ]
+
             for selector in next_button_selectors:
                 try:
+                    # Wait for element with explicit wait
+                    next_button = WebDriverWait(self.driver, 5).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    
+                    # Wait for element to be clickable
                     next_button = WebDriverWait(self.driver, 5).until(
                         EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
                     )
-                    next_button.click()
-                    time.sleep(2)  # Wait for new results to load
-                    return True
-                except:
+
+                    # Scroll into view with offset
+                    self.driver.execute_script(
+                        "arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});", 
+                        next_button
+                    )
+                    time.sleep(1)
+
+                    # Try multiple click methods
+                    try:
+                        # Try JavaScript click first
+                        self.driver.execute_script("arguments[0].click();", next_button)
+                    except:
+                        try:
+                            # Try Actions chain click
+                            from selenium.webdriver.common.action_chains import ActionChains
+                            actions = ActionChains(self.driver)
+                            actions.move_to_element(next_button).click().perform()
+                        except:
+                            # Regular click as last resort
+                            next_button.click()
+
+                    # Verify page change
+                    time.sleep(2)
+                    try:
+                        new_page = self.driver.find_element(By.CSS_SELECTOR, ".gsc-cursor-current-page")
+                        if int(new_page.text) > current_page_num:
+                            print(f"Successfully moved to page {new_page.text}")
+                            return True
+                    except:
+                        pass
+
+                except Exception as e:
+                    print(f"Failed with selector {selector}: {str(e)}")
                     continue
-                
-            print("No next page button found")
+
+            # If we get here, we couldn't find any working next button
+            print("No working next page button found")
             return False
+
         except Exception as e:
-            print(f"Error clicking next page: {e}")
+            print(f"Error in _click_next_page: {str(e)}")
+            traceback.print_exc()  # Add full traceback for debugging
             return False
-        
+
+    def _extract_content(self, url: str, title: str, snippet: str, query: str) -> tuple:
+        try:
+            image_reading_needed = False
+            self.driver.get(url)
+            print(f"Navigated to URL: {url}")
+            time.sleep(2)
+
+            response = requests.get(url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+            doc = Document(response.text)
+            
+            pub_date = None
+            confidence = 'low'
+            soup = BeautifulSoup(response.text, 'html.parser')
+            for meta in soup.find_all('meta'):
+                property_val = meta.get('property', '')
+                name_val = meta.get('name', '')
+                if any(date_tag in (property_val, name_val) for date_tag in [
+                    'article:published_time',
+                    'datePublished',
+                    'publication_date',
+                    'date',
+                    'pubdate'
+                ]):
+                    pub_date = meta.get('content')
+                    confidence = 'high'
+                    break
+
+            content = doc.summary()
+            paragraphs = justext.justext(content, justext.get_stoplist("English"))
+            content_parts = []
+            for paragraph in paragraphs:
+                if not paragraph.is_boilerplate:
+                    content_parts.append(paragraph.text)
+
+            h = html2text.HTML2Text()
+            h.ignore_links = True
+            h.ignore_images = True
+            h.ignore_emphasis = True
+            text_content = h.handle(' '.join(content_parts))
+            clean_text = clean_extracted_text(text_content)
+
+            if not clean_text.strip():
+                print(f"No text content extracted from {url}, will defer image reading.")
+                image_reading_needed = True
+
+            if not pub_date and not image_reading_needed:
+                current_date = datetime.datetime.now()
+                pub_date, confidence = self._extract_date_with_gpt(
+                    url=url,
+                    title=title,
+                    snippet=snippet,
+                    content=clean_text,
+                    current_date=current_date
+                )
+            
+            if not image_reading_needed:
+                formatted_text = f"Title: {title}\n"
+                if pub_date:
+                    formatted_text += f"Date: {pub_date}\n"
+                formatted_text += f"Content:\n{clean_text}\n"
+                self.accumulated_extracted_texts.append(formatted_text)
+
+            return clean_text, pub_date, confidence, image_reading_needed
+
+        except Exception as e:
+            print(f"Error extracting content from {url}: {str(e)}")
+            return "", None, 'low', False
+
+    def _extract_date_with_gpt(self, url: str, title: str, snippet: str, content: str, current_date: datetime.datetime) -> str:
+        try:
+            content_preview = content[:1000] + ("..." if len(content) > 1000 else "")
+            prompt = (
+                f"Given the following information about an article, determine its publication date.\n"
+                f"Current date: {current_date.strftime('%Y-%m-%d')}\n"
+                f"URL: {url}\n"
+                f"Title: {title}\n"
+                f"Snippet: {snippet}\n"
+                f"Article content preview: {content_preview}\n\n"
+                f"Return your best estimate of the publication date in JSON:\n"
+                "{\n"
+                '    "date": "YYYY-MM-DD",\n'
+                '    "confidence": "high/medium/low"\n'
+                "}\n"
+                f"ONLY respond with the JSON, no other text."
+            )
+            response = cheap_llm.invoke([HumanMessage(content=prompt)])
+            response_text = clean_response(response.content.strip())
+            response_text = response_text.replace("```json", "").replace("```", "").strip()
+
+            try:
+                result = json.loads(response_text)
+            except json.JSONDecodeError as ex:
+                print(f"Invalid JSON response: {response_text}")
+                response_text = response_text.replace("'", '"')
+                response_text = re.sub(r'(\w+):', r'"\1":', response_text)
+                try:
+                    result = json.loads(response_text)
+                except:
+                    return None, 'low'
+
+            date = result.get('date')
+            confidence = result.get('confidence', 'low')
+            if date:
+                try:
+                    datetime.datetime.strptime(date, '%Y-%m-%d')
+                except ValueError:
+                    return None, 'low'
+            return date, confidence
+
+        except Exception as e:
+            print(f"Error extracting date with GPT: {str(e)}")
+            return None, 'low'
+
+    def _post_process(self, json_results: str, query: str) -> str:
+        try:
+            cleaned_results = self._clean_results(json_results)
+
+            current_date = datetime.datetime.now()
+            for result in cleaned_results:
+                std_date, conf = self._standardize_date(result.get('date'), current_date)
+                result['standardized_date'] = std_date
+                result['date_confidence'] = conf
+                if std_date:
+                    try:
+                        dt = datetime.datetime.strptime(std_date, '%Y-%m-%d')
+                        result['age_days'] = (current_date - dt).days
+                    except:
+                        result['age_days'] = float('inf')
+                else:
+                    result['age_days'] = float('inf')
+
+            cleaned_results.sort(
+                key=lambda x: (
+                    0 if x['date_confidence'] == 'high' else 1 if x['date_confidence'] == 'medium' else 2,
+                    x['age_days']
+                )
+            )
+
+            temporal_prompt = (
+                f"Analyze this query and determine its temporal requirements: '{query}'\n"
+                f"Respond ONLY in JSON format:\n"
+                "{\n"
+                '    "recency_importance": "critical/high/medium/low",\n'
+                '    "max_age_days": number,\n'
+                '    "requires_future_prediction": true/false\n'
+                "}"
+            )
+            
+            temporal_response = cheap_llm.invoke([HumanMessage(content=temporal_prompt)])
+            temporal_requirements = json.loads(clean_response(temporal_response.content.strip()))
+
+            processed_results = []
+            summaries = []
+            current_content = ""
+            current_token_count = 0
+            chunk_counter = 0  # Add counter for chunks
+
+            for result in cleaned_results:
+                # First apply temporal filtering
+                if result['age_days'] != float('inf'):
+                    if temporal_requirements['recency_importance'] == 'critical' and result['age_days'] > 30:
+                        continue
+                    elif temporal_requirements['recency_importance'] == 'high' and result['age_days'] > 90:
+                        continue
+                    elif temporal_requirements['max_age_days'] and result['age_days'] > temporal_requirements['max_age_days']:
+                        continue
+
+                # If result passes temporal filter, process it
+                content = (
+                    f"Source: {result['url']}\n"
+                    f"Date: {result.get('standardized_date', 'Unknown')} "
+                    f"(Confidence: {result['date_confidence']})\n"
+                    f"Content: {result['content']}\n\n"
+                )
+                
+                # Rough token estimate (1 token ≈ 4 chars)
+                content_tokens = len(content) // 4
+                
+                if current_token_count + content_tokens > TOKEN_LIMIT_FOR_SUMMARY:
+                    # Save the current chunk before summarizing
+                    chunk_counter += 1
+                    self._save_research_chunk(current_content, chunk_counter)
+                    
+                    # Generate intermediate summary
+                    summary = self._generate_intermediate_summary(current_content, query)
+                    summaries.append(summary)
+                    
+                    # Reset accumulator
+                    current_content = content
+                    current_token_count = content_tokens
+                else:
+                    current_content += content
+                    current_token_count += content_tokens
+                
+                processed_results.append(result)
+
+            # Handle remaining content
+            if current_content:
+                chunk_counter += 1
+                self._save_research_chunk(current_content, chunk_counter)
+                summary = self._generate_intermediate_summary(current_content, query)
+                summaries.append(summary)
+
+            # Simply join all summaries with a separator
+            return "\n\n=== Next Batch of Results ===\n\n".join(summaries)
+
+        except Exception as e:
+            return f"Error during post-processing: {str(e)}"
+
+    def _generate_intermediate_summary(self, content: str, query: str) -> str:
+        prompt = (
+            f"Analyze and synthesize the following search results for the query: '{query}'\n\n"
+            f"Instructions:\n"
+            f"1. Synthesize the key information\n"
+            f"2. Handle conflicting info carefully, prefer more recent\n"
+            f"3. For predictive queries, highlight recent trends\n"
+            f"4. Provide summary in plain text\n\n"
+            f"Data:\n{content}\n"
+        )
+
+        response = cheap_llm.invoke([HumanMessage(content=prompt)])
+        return response.content.strip()
+
+    def _clean_results(self, results):
+        cleaned_results = []
+        for result in results:
+            content = result['content']
+            sentences = content.split('.')
+            complete_sentences = [s.strip() + '.' for s in sentences if len(s.split()) > 5]
+            cleaned_content = ' '.join(complete_sentences)
+
+            cleaned_results.append({
+                'url': result['url'],
+                'content': cleaned_content,
+                'date': result.get('date'),
+                'date_confidence': result.get('date_confidence',''),
+                'title': result.get('title', '')
+            })
+        return cleaned_results
+
+    def _standardize_date(self, date_str: str, current_date: datetime.datetime) -> tuple:
+        if not date_str:
+            return None, 'low'
+        prompt = (
+            f"Convert this date string to a standardized format.\n"
+            f"Current date: {current_date.strftime('%Y-%m-%d')}\n"
+            f"Input date: {date_str}\n\n"
+            f"Return ONLY the result in JSON:\n"
+            "{\n"
+            '    "standardized_date": "YYYY-MM-DD",\n'
+            '    "confidence": "high/medium/low"\n'
+            "}\n"
+        )
+        try:
+            response = cheap_llm.invoke([HumanMessage(content=prompt)])
+            result = json.loads(clean_response(response.content.strip()))
+            return result.get('standardized_date'), result.get('confidence', 'low')
+        except Exception as e:
+            print(f"Error standardizing date: {e}")
+            return None, 'low'
+
+    def _save_research_chunk(self, content: str, chunk_number: int) -> None:
+        """Save a chunk of research content to a numbered file."""
+        try:
+            filename = self.log_dir / f"research{self.research_counter}_{chunk_number}.txt"
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except Exception as e:
+            print(f"Error saving research chunk: {e}")

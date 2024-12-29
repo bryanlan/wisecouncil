@@ -9,3 +9,7 @@ flagged
 /temp
 /boneyard
 *.txt
+*.bak
+*.json
+/logs
+*.jpg

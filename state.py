@@ -21,3 +21,5 @@ class AgentState(TypedDict, total=False):
     debugging_info: List[Dict[str, Any]]
     # Removed 'last_conversation'
     moderatorName: str
+    tool_invocation_count: int  # Track number of tool uses
+    max_tool_invocations: int   # Store the limit
