@@ -8,7 +8,7 @@ __pycache__
 flagged
 /temp
 /boneyard
-*.txt
+debug.txt
 *.bak
 *.json
 /logs

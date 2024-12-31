@@ -468,77 +468,115 @@ class ResearchTool(Tool):
             WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.CLASS_NAME, "gsc-results"))
             )
-            time.sleep(2)  # Add small delay to ensure page is fully loaded
+            time.sleep(3)  # Increased delay to ensure page is fully loaded
             
-            # Get current page number for verification
+            # First try to find the current page number
             try:
                 current_page = self.driver.find_element(By.CSS_SELECTOR, ".gsc-cursor-current-page")
                 current_page_num = int(current_page.text)
-            except:
+                print(f"Current page: {current_page_num}")
+            except Exception as e:
+                print(f"Could not determine current page: {e}")
                 current_page_num = 1
 
-            # Updated selectors with more specific targeting
-            next_button_selectors = [
-                f".gsc-cursor-page:nth-child({current_page_num + 1})",  # Next numbered page
-                ".gsc-cursor-page:not(.gsc-cursor-current-page)",  # Any non-current page
-                ".gsc-cursor-next-page",  # Next page arrow
-                "div.gsc-cursor-page:not(.gsc-cursor-current-page):last-of-type"  # Last non-current page
-            ]
-
-            for selector in next_button_selectors:
-                try:
-                    # Wait for element with explicit wait
-                    next_button = WebDriverWait(self.driver, 5).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                    )
+            # Find all page buttons
+            try:
+                # Use a more general selector to find all page numbers
+                page_buttons = self.driver.find_elements(By.CSS_SELECTOR, ".gsc-cursor-page")
+                
+                if not page_buttons:
+                    print("No pagination buttons found")
+                    return False
                     
-                    # Wait for element to be clickable
-                    next_button = WebDriverWait(self.driver, 5).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                    )
-
-                    # Scroll into view with offset
-                    self.driver.execute_script(
-                        "arguments[0].scrollIntoView({block: 'center', behavior: 'smooth'});", 
-                        next_button
-                    )
-                    time.sleep(1)
-
-                    # Try multiple click methods
+                print(f"Found {len(page_buttons)} pagination buttons")
+                
+                # Find the next page button
+                next_page_button = None
+                for button in page_buttons:
                     try:
-                        # Try JavaScript click first
-                        self.driver.execute_script("arguments[0].click();", next_button)
-                    except:
+                        button_num = int(button.text)
+                        if button_num == current_page_num + 1:
+                            next_page_button = button
+                            break
+                    except ValueError:
+                        continue
+                    
+                if not next_page_button:
+                    print("Could not find next page button")
+                    return False
+                    
+                # Ensure the button is in view
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center', inline: 'center'});", 
+                    next_page_button
+                )
+                time.sleep(1)
+                
+                # Try to click using different methods
+                try:
+                    # Method 1: Direct click with retry
+                    max_retries = 3
+                    for _ in range(max_retries):
                         try:
-                            # Try Actions chain click
-                            from selenium.webdriver.common.action_chains import ActionChains
-                            actions = ActionChains(self.driver)
-                            actions.move_to_element(next_button).click().perform()
+                            next_page_button.click()
+                            break
                         except:
-                            # Regular click as last resort
-                            next_button.click()
-
-                    # Verify page change
-                    time.sleep(2)
-                    try:
-                        new_page = self.driver.find_element(By.CSS_SELECTOR, ".gsc-cursor-current-page")
-                        if int(new_page.text) > current_page_num:
-                            print(f"Successfully moved to page {new_page.text}")
-                            return True
-                    except:
-                        pass
-
-                except Exception as e:
-                    print(f"Failed with selector {selector}: {str(e)}")
-                    continue
-
-            # If we get here, we couldn't find any working next button
-            print("No working next page button found")
+                            time.sleep(1)
+                            continue
+                            
+                    # Method 2: JavaScript click if Method 1 failed
+                    if not self._verify_page_change(current_page_num):
+                        self.driver.execute_script("arguments[0].click();", next_page_button)
+                        
+                    # Method 3: Action chains if Method 2 failed
+                    if not self._verify_page_change(current_page_num):
+                        from selenium.webdriver.common.action_chains import ActionChains
+                        actions = ActionChains(self.driver)
+                        actions.move_to_element(next_page_button)
+                        actions.click()
+                        actions.perform()
+                    
+                    # Final verification
+                    if self._verify_page_change(current_page_num):
+                        print("Successfully changed page")
+                        return True
+                        
+                    print("Failed to verify page change after all click attempts")
+                    return False
+                    
+                except Exception as click_error:
+                    print(f"Error clicking next page button: {click_error}")
+                    return False
+                    
+            except Exception as e:
+                print(f"Error finding pagination buttons: {e}")
+                return False
+                
+        except Exception as e:
+            print(f"Error in _click_next_page: {e}")
+            traceback.print_exc()
             return False
 
+    def _verify_page_change(self, previous_page_num: int, max_wait: int = 5) -> bool:
+        """
+        Verify that the page has actually changed after clicking next.
+        Returns True if page change is confirmed, False otherwise.
+        """
+        try:
+            start_time = time.time()
+            while time.time() - start_time < max_wait:
+                try:
+                    current_page = self.driver.find_element(By.CSS_SELECTOR, ".gsc-cursor-current-page")
+                    current_num = int(current_page.text)
+                    if current_num > previous_page_num:
+                        print(f"Page change verified: {previous_page_num} -> {current_num}")
+                        return True
+                except:
+                    pass
+                time.sleep(0.5)
+            return False
         except Exception as e:
-            print(f"Error in _click_next_page: {str(e)}")
-            traceback.print_exc()  # Add full traceback for debugging
+            print(f"Error verifying page change: {e}")
             return False
 
     def _extract_content(self, url: str, title: str, snippet: str, query: str) -> tuple:
