@@ -444,7 +444,7 @@ with gr.Blocks(css="""
 
     max_iterations_input = gr.Slider(
         minimum=1,
-        maximum=40,
+        maximum=60,
         step=1,
         value=5,
         label="Max Iterations"
@@ -583,6 +583,13 @@ with gr.Blocks(css="""
                     'temperature': float(row[3]) if row[3] else 0.0
                 })
 
+        # Initialize conversation store
+        conv_store = None
+        conv_out = ""
+        debug_out = ""
+        rep_out = ""
+
+        # Run initial setup
         conv_out, debug_out, rep_out, conv_store = run_conversation_init(
             setup_info,
             council_question,
@@ -601,7 +608,33 @@ with gr.Blocks(css="""
             max_tool_invocations_val
         )
 
-        # Build the list of agent names from the DataFrame
+        # If not in override mode, run iterations
+        if not override_val:
+            while (conv_store["iteration_count"] < conv_store["max_iterations"] and 
+                   conv_store["state"]["nextAgent"] != "END"):
+                # Run one iteration
+                conv_store = run_conversation_iter(conv_store)
+                
+                # Update outputs
+                state = conv_store["state"]
+                conv_out = format_messages(state["conversation_messages"], conv_store["suppressResearch"])
+                debug_out = collect_debugging_text(state)
+                
+                # Update Gradio outputs in real-time
+                gr.update(value=conv_out)
+                gr.update(value=debug_out)
+
+            # Generate final report if needed
+            if conv_store["prepare_report"]:
+                question_text = state["conversation_messages"][0].content if state["conversation_messages"] else ""
+                rep_out = produce_report_if_requested(
+                    state,
+                    conv_store["prepare_report"],
+                    conv_store["reporterPrompt"],
+                    question_text
+                )
+
+        # Build the list of agent names for override mode
         agent_names = []
         if isinstance(agents_df_val, list):  # If it's a list of lists
             for row in agents_df_val:
@@ -630,14 +663,14 @@ with gr.Blocks(css="""
                     ai_mod_response = last_msg.content.replace("Moderator: ", "", 1)
                     ai_next_agent = state["nextAgent"]
 
-        # Return partial or final conversation
+        # Return final state
         return (
-            conv_out,
-            debug_out,
-            rep_out,
+            conv_out,  # Return actual string instead of gr.update
+            debug_out, # Return actual string instead of gr.update
+            rep_out,   # Return actual string instead of gr.update
             conv_store,
             gr.update(choices=agent_choices, value=ai_next_agent),
-            gr.update(value=ai_mod_response)  # Set default value for human_moderator_response
+            gr.update(value=ai_mod_response)
         )
 
     run_button.click(
@@ -666,7 +699,8 @@ with gr.Blocks(css="""
             conversation_store_state,
             which_agent_next,
             human_moderator_response
-        ]
+        ],
+        show_progress=True
     )
 
     ############################################################################
@@ -686,9 +720,9 @@ with gr.Blocks(css="""
         # Check if next agent is selected when using override
         if not user_next_agent:
             return (
-                gr.update(value="ERROR: You must select which agent should respond next before continuing."),
-                gr.update(),  # Keep debugging output unchanged
-                gr.update(),  # Keep report output unchanged
+                "ERROR: You must select which agent should respond next before continuing.",
+                "",  # Keep debugging output unchanged
+                "",  # Keep report output unchanged
                 conversation_store,  # Keep conversation store unchanged
                 gr.update(),  # Keep radio buttons unchanged
                 gr.update()  # Keep moderator response unchanged
@@ -711,9 +745,17 @@ with gr.Blocks(css="""
         # 2) run one iteration of feedback agent with the override moderator text
         updated_store = run_conversation_iter(updated_store)
 
+        # Update outputs after feedback agent
+        state = updated_store["state"]
+        conv_out = format_messages(state["conversation_messages"], updated_store["suppressResearch"])
+        debug_out = collect_debugging_text(state)
+        
+        # Update Gradio outputs in real-time
+        gr.update(value=conv_out)
+        gr.update(value=debug_out)
+
         # 3) If we just ran a feedback agent and conversation isn't ended,
         # also run the moderator to get their response ready
-        state = updated_store["state"]
         if (state["nextAgent"] != "END" and 
             updated_store["iteration_count"] < updated_store["max_iterations"]):
             
@@ -764,7 +806,15 @@ with gr.Blocks(css="""
         radio_update = gr.update(choices=agent_choices, value=ai_next_agent)
         text_update = gr.update(value=ai_mod_response)
 
-        return conv_out, debug_out, report_out, updated_store, radio_update, text_update
+        # Return final update
+        return (
+            conv_out,  # Return actual string instead of gr.update
+            debug_out, # Return actual string instead of gr.update
+            report_out, # Return actual string instead of gr.update
+            updated_store,
+            radio_update,
+            text_update
+        )
 
     apply_override_button.click(
         fn=apply_override_and_continue,
@@ -776,7 +826,8 @@ with gr.Blocks(css="""
             conversation_store_state,
             which_agent_next,
             human_moderator_response
-        ]
+        ],
+        show_progress=True
     )
 
 demo.launch(share=False)

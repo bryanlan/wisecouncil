@@ -264,10 +264,14 @@ class FeedbackAgent(BaseAgent):
         
         state['conversation_messages'].append(AIMessage(content=final_response_text))
         
-        # Rest of the method remains the same...
+        # Handle next agent selection based on topology
         if self.topology == 'last_decides_next':
             next_agent = self._determine_next_agent(state['conversation_messages'])
-            state['nextAgent'] = next_agent
+            # If there's a moderator and agent tries to end, return to moderator instead
+            if next_agent == 'END' and state.get('moderatorName'):
+                state['nextAgent'] = state['moderatorName']
+            else:
+                state['nextAgent'] = next_agent
         elif self.topology == 'round_robin':
             current_idx = self.agent_names.index(self.name)
             next_idx = (current_idx + 1) % len(self.agent_names)
@@ -401,7 +405,7 @@ class SetupAgent:
             f"     * 'name': The agent's friendly name\n"
             f"     * 'type': The LLM to use (from the available agents)\n"
             f"     * 'role': The system prompt for the agent that describes who the agent is\n"
-            f"2. If a moderator is requested, include 'moderator_prompt': A proposed system prompt for the moderator, which includes 1. How the moderator should focus the discussion, be very precise in repeating any relevant setup information. 2. 'The list of agents is' <Exact Agent Names as listed above> 3. Agent names followed by their roles (not model type) \n\n"
+            f"2. If a moderator is requested, include 'moderator_prompt': A proposed system prompt for the moderator, which includes 1. How the moderator should focus the discussion, be very precise in repeating any relevant setup information. 2. Agent names (NOT model type)followed by their roles (not model type) \n\n"
             f"Please return the JSON without any additional text or formatting."
         )
 
