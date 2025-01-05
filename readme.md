@@ -58,8 +58,6 @@ Below is a high-level overview of the primary files and their roles:
 
 ```
 
-> **Note**: The `requirements.txt` file is not included in the snippet above but is recommended for ensuring consistent dependencies.
-
 ----------
 
 ## Quick Start
@@ -105,6 +103,9 @@ Below is a high-level overview of the primary files and their roles:
     -   **Agent Control Flow**: Select how agents should be invoked (e.g., round robin, last decides next, moderator-based, etc.).
     -   **Generate Setup**: This step calls the `SetupAgent` to propose a set of agents, roles, and LLM assignments.
     -   **Begin Conversation**: Kicks off the conversation loop. If “human moderator override” is ON, you can modify the moderator’s instructions after each iteration to direct the conversation.
+  
+![image](https://github.com/user-attachments/assets/e9fad3d6-cd7c-4b9d-b5ef-090ade163321)
+
 
 ----------
 
