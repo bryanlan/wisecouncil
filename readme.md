@@ -83,9 +83,9 @@ Below is a high-level overview of the primary files and their roles:
     ```
     
 2.  **Set Up Credentials**
-    
-    -   **Google**: A valid [Google Custom Search API key and Search Engine ID](https://developers.google.com/custom-search/v1/overview) in `config.keys.GOOGLE_API_KEY` and `config.keys.GOOGLE_SEARCH_ENGINE_ID`.
-    -   **Reddit**: A valid Reddit API client ID, secret, and user agent in `keys.py` (or similar) for the `redditlib.py` module.
+    -   You will need to rename keysdummy.py to keys.py and populate the keys below. 
+    -   **Google** (required for research tool): A valid [Google Custom Search API key and Search Engine ID](https://developers.google.com/custom-search/v1/overview) in `config.keys.GOOGLE_API_KEY` and `config.keys.GOOGLE_SEARCH_ENGINE_ID`.
+    -   **Reddit** (required for sentiment analysis tool) : A valid Reddit API client ID, secret, and user agent in `keys.py` (or similar) for the `redditlib.py` module.
     -   **OpenAI / Anthropic / Others**: If you plan to use them, ensure you have the appropriate environment variables / keys set.
 3.  **Launch the Application**
     
