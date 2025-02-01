@@ -7,7 +7,6 @@ import keys  # Assuming this is a module with API keys
 # Environment variables
 os.environ["OPENAI_API_KEY"] = keys.OPENAI_KEY
 os.environ["ANTHROPIC_API_KEY"] = keys.CLAUDE_KEY
-os.environ["TAVILY_API_KEY"] = keys.TAVILY_KEY
 os.environ["GOOGLE_API_KEY"] = keys.GOOGLE_API_KEY
 os.environ["XAI_API_KEY"] = keys.GROK_API_KEY
 os.environ["GOOGLE_SEARCH_ID"] = keys.GOOGLE_SEARCH_ENGINE_ID

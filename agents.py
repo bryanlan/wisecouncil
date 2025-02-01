@@ -404,8 +404,8 @@ class SetupAgent:
             f"   - For all other agents:\n"
             f"     * 'name': The agent's friendly name\n"
             f"     * 'type': The LLM to use (from the available agents)\n"
-            f"     * 'role': The system prompt for the agent that describes who the agent is\n"
-            f"2. If a moderator is requested, include 'moderator_prompt': A proposed system prompt for the moderator, which includes 1. How the moderator should focus the discussion, be very precise in repeating any relevant setup information. 2. Agent names (NOT model type)followed by their roles (not model type) \n\n"
+            f"     * 'role': The system prompt for the agent that describes what you think the agent should do to contribute to the conversation\n"
+            f"2. If a moderator is requested, include 'moderator_prompt': A proposed system prompt for the moderator, which MUST include 1. How the moderator should focus the discussion, be very precise in repeating any relevant setup information. 2. Agent names (NOT model type)followed by their roles (not model type). \n\n"
             f"Please return the JSON without any additional text or formatting."
         )
 

@@ -110,9 +110,9 @@ def create_llm(model_type: str, temperature: float = 0) -> RetryLLM:
     if model_type == "openai_gpt4o":
         return RetryLLM(SystemMessageHandlingLLM(ChatOpenAI(model="gpt-4o", temperature=temperature)))
     elif model_type == "anthropic_claude":
-        return RetryLLM(SystemMessageHandlingLLM(ChatAnthropic(model_name="claude-3-5-sonnet-20240620", temperature=temperature)))
+        return RetryLLM(SystemMessageHandlingLLM(ChatAnthropic(model_name="claude-3-5-sonnet-20240620", temperature=max(0, min(1, temperature)))))
     elif model_type == "google_gemini":
-        return RetryLLM(SystemMessageHandlingLLM(ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=temperature, api_key=GEMINI_KEY)))
+        return RetryLLM(SystemMessageHandlingLLM(ChatGoogleGenerativeAI(model="gemini-exp-1206", temperature=max(0, min(1, temperature)), api_key=GEMINI_KEY)))
     elif model_type == "xai_grok":
         return RetryLLM(SystemMessageHandlingLLM(ChatXAI(model="grok-beta", temperature=temperature)))
     elif model_type == "deepseek_chat":
@@ -156,7 +156,7 @@ available_llms = [
     },
      {
         "name": "google_gemini",
-        "description": "Google's Gemini model, a state-of-the-art multimodal AI model.",
+        "description": "Google's Gemini model, a best-in-class foundation model capable of general use.",
         "llm": gemini_llm
      },
     {
@@ -166,7 +166,7 @@ available_llms = [
     },
     {
         "name": "deepseek_chat",
-        "description": "DeepSeek's Chat model, cost-effective foundational model.",
+        "description": "DeepSeek's Chat model, a best-in-class foundation model capable of general use.",
         "llm": deepseek_llm
     },
     {

@@ -1,6 +1,6 @@
 # tools.py
 
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import time
 import base64
 import os
@@ -14,6 +14,7 @@ import copy
 from PIL import Image
 from urllib.parse import quote_plus
 from pathlib import Path
+from io import BytesIO
 
 from googleapiclient.discovery import build
 from readability import Document
@@ -268,6 +269,146 @@ class ResearchTool(Tool):
         except json.JSONDecodeError:
             return query, [], [], "any"
 
+    def _resize_image_for_api(self, img: Image.Image, max_size: int = 1024) -> Image.Image:
+        """
+        Resize image to be within API limits while maintaining aspect ratio.
+        """
+        # Get current dimensions
+        width, height = img.size
+        
+        # Calculate scaling factor
+        scale = min(max_size / width, max_size / height)
+        
+        # Only resize if image is too large
+        if scale < 1:
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+        # Convert to RGB if necessary (removing alpha channel)
+        if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+            bg = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+            
+        return img
+
+    def _detect_captcha(self) -> Tuple[bool, Optional[str]]:
+        """
+        Takes a screenshot of the current page and uses cheap_llm to detect if it's a CAPTCHA.
+        Returns a tuple of (is_captcha, captcha_url).
+        """
+        try:
+            # Take screenshot
+            screenshot = self.driver.get_screenshot_as_png()
+            img = Image.open(BytesIO(screenshot))
+            
+            # Resize image
+            img = self._resize_image_for_api(img)
+            
+            buffered = BytesIO()
+            img.save(buffered, format="JPEG", quality=85)
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+
+            # Analyze screenshot with cheap_llm
+            prompt = (
+                "Analyze this screenshot and determine if it shows a Google CAPTCHA verification page.\n"
+                "If it is a CAPTCHA page:\n"
+                "1. Look for any URL or link that needs to be clicked to complete verification\n"
+                "2. Return the exact URL if found\n\n"
+                "Respond in JSON format:\n"
+                "{\n"
+                '    "is_captcha": true/false,\n'
+                '    "captcha_url": "url or null",\n'
+                '    "explanation": "brief explanation of what you see"\n'
+                "}"
+            )
+
+            messages = [
+                HumanMessage(content=[
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_str}"
+                        }
+                    }
+                ])
+            ]
+            
+            response = cheap_llm.invoke(messages)
+            result = json.loads(clean_response(response.content))
+            
+            return result["is_captcha"], result.get("captcha_url")
+            
+        except Exception as e:
+            print(f"Error in CAPTCHA detection: {e}")
+            return False, None
+
+    def _analyze_image(self, image_data: str, query: str) -> Optional[str]:
+        """
+        Analyze an image using cheap_llm's multimodal capabilities.
+        Returns a description of the image content relevant to the query context.
+        
+        Args:
+            image_data (str): Base64 encoded image data
+            query (str): The search query to provide context
+        """
+        try:
+            # Save image for debugging
+            try:
+                img_data = base64.b64decode(image_data)
+                img = Image.open(BytesIO(img_data))
+                
+                # Resize image
+                img = self._resize_image_for_api(img)
+                
+                # Save resized image
+                buffered = BytesIO()
+                img.save(buffered, format="JPEG", quality=85)
+                image_data = base64.b64encode(buffered.getvalue()).decode()
+                
+                with open('redditpic.jpg', 'wb') as f:
+                    f.write(buffered.getvalue())
+                print("Saved debug image as redditpic.jpg")
+            except Exception as e:
+                print(f"Failed to save debug image: {e}")
+
+            prompt = (
+                f"Analyze this image in the context of the following query: '{query}'\n\n"
+                f"Please describe:\n"
+                f"1. Any information in the image that's relevant to the query\n"
+                f"2. Any visible text that relates to the topic\n"
+                f"3. If it's a chart/graph, enumerate all key data points and explain the data especially as it relates to the query\n"
+                f"4. If it's a meme, explain its meaning in relation to the topic\n\n"
+                f"Do not leave out any key points or data, add as much detail as necessary\n"
+                f"Focus only on aspects relevant to '{query}'. Ignore unrelated content. If all content is unrelated, return 'No relevant content found in image'."
+            )
+
+            messages = [
+                HumanMessage(content=[
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_data}"
+                        }
+                    }
+                ])
+            ]
+            
+            response = cheap_llm.invoke(messages)
+            if response.content.strip() == "No relevant content found in image.":
+                return ""
+            else: 
+                return response.content.strip()
+            
+        except Exception as e:
+            print(f"Error analyzing image: {e}")
+            return None
+
     def _google_search(self, query: str, required_terms: list, excluded_terms: list, time_range: str, num_results: int = None):
         print(f"Starting google_search with query: {query}")
         all_results = []
@@ -281,9 +422,11 @@ class ResearchTool(Tool):
             search_query = f'{query} -site:youtube.com -site:youtu.be -site:washingtonpost.com'
             url = f"https://cse.google.com/cse?cx={self.search_engine_id}&q={quote_plus(search_query)}"
             
-            self.driver.get(url)
-            
-            while page_count < max_pages:
+            # Function to perform the search
+            def perform_search():
+                self.driver.get(url)
+                time.sleep(2)  # Wait for page to load
+                
                 WebDriverWait(self.driver, 10).until(
                     EC.presence_of_element_located((By.CLASS_NAME, "gsc-result"))
                 )
@@ -306,9 +449,30 @@ class ResearchTool(Tool):
                 return results;
                 """
                 
-                page_results = self.driver.execute_script(js_script)
-                print(f"Found {len(page_results)} results on page {page_count + 1}")
+                return self.driver.execute_script(js_script)
 
+            # Initial search attempt
+            page_results = perform_search()
+            print(f"Found {len(page_results)} results on page {page_count + 1}")
+
+            # If no results, check for CAPTCHA
+            if not page_results:
+                print(f"No results found, checking for CAPTCHA...")
+                is_captcha, captcha_url = self._detect_captcha()
+                if is_captcha:
+                    # Create a dialog message with the URL
+                    dialog_msg = f"Google CAPTCHA detected. Please complete the verification at:\n{captcha_url if captcha_url else 'URL not found'}"
+                    print(dialog_msg)
+                    # Wait for user to complete CAPTCHA
+                    input("Press Enter after completing the CAPTCHA verification...")
+                    # Retry the search
+                    print("Retrying search after CAPTCHA verification...")
+                    page_results = perform_search()
+                    if not page_results:
+                        print(f"Still no results found after CAPTCHA verification")
+                        return []
+            
+            while page_count < max_pages:
                 if not page_results:
                     print(f"No results found for URL: {url}")
                     return []
@@ -388,6 +552,9 @@ class ResearchTool(Tool):
                     break
                     
                 page_count += 1
+                # Get results from next page
+                page_results = perform_search()
+                print(f"Found {len(page_results)} results on page {page_count + 1}")
 
             if len(all_results) > 0:
                 self.has_successful_search = True

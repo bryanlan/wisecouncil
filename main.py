@@ -4,6 +4,8 @@ import gradio as gr
 from typing import List, Dict, Any, Tuple
 import time
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+import json
+import os
 from llms import available_llms, sota_llm, create_llm
 from config import debugme, TOOLPREFIX, moderatorPromptEnd, PROMPT_LENGTH_THRESHOLD
 from utils import clean_response, format_messages
@@ -13,6 +15,7 @@ from sentiment import RedditSentimentTool  # NEW import for the Reddit sentiment
 from state import AgentState
 import copy
 
+AGENT_CONFIG_FILE = "agent_configs.json"
 ###############################################################################
 # SETUP AGENT
 ###############################################################################
@@ -106,6 +109,175 @@ def produce_report_if_requested(
     )
     response = sota_llm.invoke([HumanMessage(content=report_prompt)])
     return response.content.strip()
+    
+    
+    
+def load_agent_configs() -> Dict[str, Any]:
+    """Load all saved agent configs from local JSON file."""
+    if not os.path.exists(AGENT_CONFIG_FILE):
+        return {}
+    try:
+        with open(AGENT_CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+    
+def save_agent_configs(configs: Dict[str, Any]) -> None:
+    """Save all agent configs to the local JSON file."""
+    with open(AGENT_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(configs, f, indent=2)
+    
+def populate_agent_config_dropdown() -> List[str]:
+    """Return list of saved config names, plus 'add new' at the front."""
+    configs = load_agent_configs()
+    names = sorted(configs.keys())
+    return ["add new"] + names
+    
+def on_config_dropdown_change(selected_config: str):
+    """
+    When user picks a config from dropdown:
+    - If 'add new', return blanks
+    - Else load from JSON, fill UI
+    """
+    if selected_config == "add new":
+        return (
+            gr.update(value=""),  # config_name
+            gr.update(value=None),  # topology
+            gr.update(value=[[ "", "", "", 0.0 ]]),  # agents_dataframe
+            gr.update(value=""),  # moderator_prompt
+            gr.update(value=""),  # council_question
+            gr.update(value=False),  # suppress_webpage_popups
+            gr.update(value=False),  # disable_tools
+            gr.update(value=4),      # max_image_per_webpage
+            gr.update(value=10),     # max_total_image_interpretations
+            gr.update(value=False),  # suppress_research
+            gr.update(value=False),  # prepare_report
+            gr.update(value=False),  # human_moderator_override
+            gr.update(value=3),      # max_tool_invocations
+            gr.update(value="")      # setup_info
+        )
+    else:
+        configs = load_agent_configs()
+        cfg = configs.get(selected_config, {})
+        
+        # Ensure agents_data is properly formatted for Gradio DataFrame
+        agents_data = cfg.get("agents_data", [[ "", "", "", 0.0 ]])
+        # Convert any string/number values to their proper types
+        formatted_agents_data = []
+        for row in agents_data:
+            if len(row) >= 4:  # Ensure row has all required fields
+                formatted_row = [
+                    str(row[0]),     # name as string
+                    str(row[1]),     # type as string
+                    str(row[2]),     # role as string
+                    float(row[3])    # temperature as float
+                ]
+                formatted_agents_data.append(formatted_row)
+        
+        if not formatted_agents_data:  # If empty after formatting
+            formatted_agents_data = [[ "", "", "", 0.0 ]]
+        
+        return (
+            gr.update(value=selected_config),  # config_name
+            gr.update(value=cfg.get("topology")),  # topology
+            gr.update(value=formatted_agents_data),  # agents_dataframe
+            gr.update(value=cfg.get("moderator", "")),  # moderator_prompt
+            gr.update(value=cfg.get("council_question", "")),  # council_question
+            gr.update(value=cfg.get("suppress_webpage_popups", False)),  # suppress_webpage_popups
+            gr.update(value=cfg.get("disable_tools", False)),  # disable_tools
+            gr.update(value=cfg.get("max_image_per_webpage", 4)),  # max_image_per_webpage
+            gr.update(value=cfg.get("max_total_image_interpretations", 10)),  # max_total_image_interpretations
+            gr.update(value=cfg.get("suppress_research", False)),  # suppress_research
+            gr.update(value=cfg.get("prepare_report", False)),  # prepare_report
+            gr.update(value=cfg.get("human_moderator_override", False)),  # human_moderator_override
+            gr.update(value=cfg.get("max_tool_invocations", 3)),  # max_tool_invocations
+            gr.update(value=cfg.get("setup_info", ""))  # setup_info
+        )
+    
+def on_save_agent_config(
+    config_name: str,
+    topology: str,
+    agents_data: List[List[Any]],
+    moderator_prompt: str,
+    council_question: str,
+    suppress_webpage_popups: bool,
+    disable_tools: bool,
+    max_image_per_webpage: int,
+    max_total_image_interpretations: int,
+    suppress_research: bool,
+    prepare_report: bool,
+    human_moderator_override: bool,
+    max_tool_invocations: int,
+    setup_info: str  # Add setup info parameter
+    ):
+    """
+    Save or update the agent config in the JSON file.
+    If no name, show error in config_name field.
+    """
+    if not config_name.strip():
+        return (
+            gr.update(value="Please provide a valid config name!", label="Agent Config Name (Error)"),
+            gr.update(choices=populate_agent_config_dropdown())
+        )
+    
+    # Convert agents_data to a JSON-serializable format if it's a DataFrame
+    if hasattr(agents_data, 'values') and hasattr(agents_data, 'to_dict'):  # Check if it's a DataFrame
+        agents_data = agents_data.values.tolist()
+    elif isinstance(agents_data, list) and agents_data and hasattr(agents_data[0], '_asdict'):  # Named tuple list
+        agents_data = [list(row) for row in agents_data]
+    
+    configs = load_agent_configs()
+    configs[config_name] = {
+        "topology": topology,
+        "agents_data": agents_data,
+        "moderator": moderator_prompt,
+        "council_question": council_question,
+        "suppress_webpage_popups": suppress_webpage_popups,
+        "disable_tools": disable_tools,
+        "max_image_per_webpage": max_image_per_webpage,
+        "max_total_image_interpretations": max_total_image_interpretations,
+        "suppress_research": suppress_research,
+        "prepare_report": prepare_report,
+        "human_moderator_override": human_moderator_override,
+        "max_tool_invocations": max_tool_invocations,
+        "setup_info": setup_info  # Save setup info
+    }
+    save_agent_configs(configs)
+    
+    # Get updated choices list
+    updated_choices = populate_agent_config_dropdown()
+    
+    return (
+        gr.update(value=config_name, label="Agent Config Name"),
+        gr.update(choices=updated_choices, value=config_name)  # Update both choices and value
+        )
+    
+def on_delete_agent_config(selected_config: str):
+    """
+    Delete the selected config from file if it exists.
+    Then reset UI to 'add new'.
+    """
+    configs = load_agent_configs()
+    if selected_config in configs:
+        del configs[selected_config]
+        save_agent_configs(configs)
+    return (
+        gr.update(value="add new", choices=populate_agent_config_dropdown()),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(value=""),
+        [[ "", "", "", 0.0 ]],
+        gr.update(value=False),  # suppress_webpage_popups
+        gr.update(value=False),  # disable_tools
+        gr.update(value=4),      # max_image_per_webpage
+        gr.update(value=10),     # max_total_image_interpretations
+        gr.update(value=False),  # suppress_research
+        gr.update(value=False),  # prepare_report
+        gr.update(value=False),  # human_moderator_override
+        gr.update(value=3),      # max_tool_invocations
+        gr.update(value="")      # setup_info
+    )
+    
 
 ###############################################################################
 # ONE-STEP CHAIN EXECUTION
@@ -441,6 +613,16 @@ with gr.Blocks(css="""
     with gr.Row():
         moderator_prompt_textbox = gr.Textbox(label="Moderator Prompt", lines=5)
 
+    with gr.Row():
+        config_dropdown = gr.Dropdown(
+            choices=populate_agent_config_dropdown(),
+            value="add new",
+            label="Saved Agent Configs"
+        )
+        config_name_textbox = gr.Textbox(label="Agent Config Name")
+        save_config_button = gr.Button("Save Config")
+        delete_config_button = gr.Button("Delete Config")
+
 
     max_iterations_input = gr.Slider(
         minimum=1,
@@ -513,6 +695,70 @@ with gr.Blocks(css="""
         ]
     )
 
+    # Wire up config load/save/delete
+    config_dropdown.change(
+        fn=on_config_dropdown_change,
+        inputs=config_dropdown,
+        outputs=[
+            config_name_textbox,
+            topology_dropdown,
+            agents_dataframe,
+            moderator_prompt_textbox,
+            council_question_input,
+            suppress_webpage_popups,
+            disable_tools,
+            max_image_per_webpage,
+            max_total_image_interpretations,
+            suppress_research,
+            prepare_report,
+            human_moderator_override,
+            max_tool_invocations,
+            setup_info_input
+        ]
+    )
+    save_config_button.click(
+        fn=on_save_agent_config,
+        inputs=[
+            config_name_textbox,
+            topology_dropdown,
+            agents_dataframe,
+            moderator_prompt_textbox,
+            council_question_input,
+            suppress_webpage_popups,
+            disable_tools,
+            max_image_per_webpage,
+            max_total_image_interpretations,
+            suppress_research,
+            prepare_report,
+            human_moderator_override,
+            max_tool_invocations,
+            setup_info_input
+        ],
+        outputs=[
+            config_name_textbox,
+            config_dropdown
+        ]
+    )
+    delete_config_button.click(
+        fn=on_delete_agent_config,
+        inputs=[config_dropdown],
+        outputs=[
+            config_dropdown,
+            config_name_textbox,
+            moderator_prompt_textbox,
+            council_question_input,
+            agents_dataframe,
+            suppress_webpage_popups,
+            disable_tools,
+            max_image_per_webpage,
+            max_total_image_interpretations,
+            suppress_research,
+            prepare_report,
+            human_moderator_override,
+            max_tool_invocations,
+            setup_info_input
+        ]
+    )
 
     ############################################################################
     # Toggle moderator override UI
@@ -608,9 +854,14 @@ with gr.Blocks(css="""
             max_tool_invocations_val
         )
 
+        # Initialize iteration count if not present
+        if conv_store and "iteration_count" not in conv_store:
+            conv_store["iteration_count"] = 0
+
         # If not in override mode, run iterations
         if not override_val:
-            while (conv_store["iteration_count"] < conv_store["max_iterations"] and 
+            while (conv_store and 
+                   conv_store["iteration_count"] < conv_store["max_iterations"] and 
                    conv_store["state"]["nextAgent"] != "END"):
                 # Run one iteration
                 conv_store = run_conversation_iter(conv_store)
@@ -626,9 +877,9 @@ with gr.Blocks(css="""
 
             # Generate final report if needed
             if conv_store["prepare_report"]:
-                question_text = state["conversation_messages"][0].content if state["conversation_messages"] else ""
+                question_text = conv_store["state"]["conversation_messages"][0].content if conv_store["state"]["conversation_messages"] else ""
                 rep_out = produce_report_if_requested(
-                    state,
+                    conv_store["state"],
                     conv_store["prepare_report"],
                     conv_store["reporterPrompt"],
                     question_text
