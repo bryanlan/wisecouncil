@@ -16,10 +16,9 @@ from pathlib import Path
 from tools import Tool
 from redditlib import RedditSearchWrapper
 from keys import REDDIT_CLIENT_ID, REDDIT_SECRET, REDDIT_USER_AGENT
-from langchain_core.messages import HumanMessage, SystemMessage
 from utils import clean_response, clean_extracted_text
 from config import TOKEN_LIMIT_FOR_SUMMARY
-from llms import cheap_llm
+from llms import cheap_llm, HumanMessage, SystemMessage
 
 class RedditSentimentTool(Tool):
     # Add constant at top of class

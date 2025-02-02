@@ -29,10 +29,9 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
-from langchain_core.messages import HumanMessage
 from utils import clean_response, clean_extracted_text
 from config import keys, TOKEN_LIMIT_FOR_SUMMARY
-from llms import sota_llm, cheap_llm  
+from llms import sota_llm, cheap_llm, HumanMessage
 
 class Tool:
     def __init__(self, name: str, description: str, func):

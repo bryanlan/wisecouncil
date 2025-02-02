@@ -1,7 +1,7 @@
 # state.py
 
 from typing import TypedDict, List, Union, Dict, Any
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from llms import HumanMessage, AIMessage, SystemMessage
 
 class AgentState(TypedDict, total=False):
     # conversation_messages holds the full conversational context
